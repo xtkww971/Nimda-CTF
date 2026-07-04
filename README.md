@@ -16,4 +16,4 @@ Nimda Judge Server은 사용자가 제출한 소스 코드를 안전하게 격�
 
 ## 시스템 아키텍처 (System Architecture)
 
-<img src="./img/System Architecture.png">
+<img src="./ReadME-img/System Architecture.png">
