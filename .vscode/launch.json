@@ -1,0 +1,33 @@
+{
+  // Requires the VSCode "Go" extension (installs Delve automatically on first use).
+  // Open this "Judge Server" folder (not "worker/") as your workspace root -
+  // go.work at the repo root tells gopls where the module lives.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Worker (local)",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/worker/cmd/worker",
+      "cwd": "${workspaceFolder}/worker",
+      "envFile": "${workspaceFolder}/worker/.env",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Debug Current Package Tests",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${fileDirname}",
+      "cwd": "${workspaceFolder}/worker"
+    },
+    {
+      "name": "Attach to Running Worker (dlv)",
+      "type": "go",
+      "request": "attach",
+      "mode": "local",
+      "processId": "${command:pickProcess}"
+    }
+  ]
+}

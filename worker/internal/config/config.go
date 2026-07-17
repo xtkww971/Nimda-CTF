@@ -34,6 +34,12 @@ type Config struct {
 	// Reconnect backoff for transient Redis/network failures
 	ReconnectBaseDelay time.Duration
 	ReconnectMaxDelay  time.Duration
+
+	// PprofAddr, if non-empty, starts a net/http/pprof debug server on this
+	// address (e.g. "localhost:6060"). Empty (the default) disables it -
+	// pprof exposes call stacks/memory contents, so it must never be bound
+	// to a non-loopback address outside a developer's own machine.
+	PprofAddr string
 }
 
 func Load() (Config, error) {
@@ -65,6 +71,8 @@ func Load() (Config, error) {
 
 		ReconnectBaseDelay: getEnvDuration("JUDGE_QUEUE_RECONNECT_BASE_DELAY", 500*time.Millisecond),
 		ReconnectMaxDelay:  getEnvDuration("JUDGE_QUEUE_RECONNECT_MAX_DELAY", 30*time.Second),
+
+		PprofAddr: getEnv("PPROF_ADDR", ""),
 	}
 
 	if cfg.MaxDeliveries < 1 {

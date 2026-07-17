@@ -7,8 +7,11 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof/* on http.DefaultServeMux; only served if cfg.PprofAddr is set
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,7 +23,11 @@ import (
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// LOG_LEVEL is read directly (not via config.Load) so the logger exists
+	// before configuration is validated and can report a bad config.
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: parseLogLevel(os.Getenv("LOG_LEVEL")),
+	}))
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -32,6 +39,15 @@ func main() {
 		"streamKey", cfg.StreamKey,
 		"consumerGroup", cfg.ConsumerGroup,
 	)
+
+	if cfg.PprofAddr != "" {
+		go func() {
+			logger.Info("starting pprof debug server", "addr", cfg.PprofAddr)
+			if err := http.ListenAndServe(cfg.PprofAddr, nil); err != nil {
+				logger.Error("pprof server stopped", "error", err)
+			}
+		}()
+	}
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.RedisAddr,
@@ -57,6 +73,22 @@ func main() {
 	logger.Info("judge worker ready, consuming submissions")
 	consumer.Run(ctx)
 	logger.Info("shutdown signal received, worker stopped")
+}
+
+// parseLogLevel maps LOG_LEVEL (debug/info/warn/error, case-insensitive) to
+// a slog.Level, defaulting to Info on anything unrecognized so a typo
+// doesn't silently suppress normal-severity logs.
+func parseLogLevel(s string) slog.Level {
+	switch strings.ToLower(s) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // waitForRedis retries the initial connection with backoff instead of

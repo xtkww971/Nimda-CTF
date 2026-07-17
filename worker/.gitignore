@@ -3,3 +3,4 @@
 /worker.exe
 *.test
 *.out
+coverage.html
