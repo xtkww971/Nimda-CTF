@@ -16,6 +16,12 @@ type Config struct {
 	RedisPassword string
 	RedisDB       int
 
+	// AWS connection
+	AWSRegion          string
+	AWSAccessKeyID     string
+	AWSSecretAccessKey string
+	S3BucketName       string
+
 	// Consumer group topology - must match the producer (nimda-cite backend).
 	// Unexported and only reachable through the getters below so every
 	// read goes through one place - see the getter docs for what each
@@ -70,6 +76,11 @@ func Load() (Config, error) {
 		consumerGroup:       getEnv("JUDGE_QUEUE_CONSUMER_GROUP", "judge-workers"),
 		consumerName:        consumerName,
 		deadLetterStreamKey: getEnv("JUDGE_QUEUE_DEAD_LETTER_STREAM_KEY", "judge:submissions:dead-letter"),
+
+		AWSRegion:          getEnv("AWS_S3_REGION", "ap-northeast-2"),
+		AWSAccessKeyID:     getEnv("AWS_S3_ACCESS_KEY", ""),
+		AWSSecretAccessKey: getEnv("AWS_S3_SECRET_KEY", ""),
+		S3BucketName:       getEnv("AWS_S3_BUCKET", "nimda-website"),
 
 		BatchSize:    getEnvInt64("JUDGE_QUEUE_BATCH_SIZE", 10),
 		BlockTimeout: getEnvDuration("JUDGE_QUEUE_BLOCK_TIMEOUT", 5*time.Second),
