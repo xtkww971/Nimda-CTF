@@ -12,13 +12,13 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if cfg.StreamKey != "judge:submissions" {
-		t.Errorf("StreamKey = %q, want %q", cfg.StreamKey, "judge:submissions")
+	if cfg.StreamKey() != "judge:submissions" {
+		t.Errorf("StreamKey = %q, want %q", cfg.StreamKey(), "judge:submissions")
 	}
-	if cfg.ConsumerGroup != "judge-workers" {
-		t.Errorf("ConsumerGroup = %q, want %q", cfg.ConsumerGroup, "judge-workers")
+	if cfg.ConsumerGroup() != "judge-workers" {
+		t.Errorf("ConsumerGroup = %q, want %q", cfg.ConsumerGroup(), "judge-workers")
 	}
-	if cfg.ConsumerName == "" {
+	if cfg.ConsumerName() == "" {
 		t.Error("ConsumerName should default to hostname-pid, got empty string")
 	}
 	if cfg.MaxDeliveries != 5 {
@@ -40,11 +40,11 @@ func TestLoadRespectsEnvOverrides(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if cfg.StreamKey != "test:submissions" {
-		t.Errorf("StreamKey = %q, want override value", cfg.StreamKey)
+	if cfg.StreamKey() != "test:submissions" {
+		t.Errorf("StreamKey = %q, want override value", cfg.StreamKey())
 	}
-	if cfg.ConsumerName != "worker-under-test" {
-		t.Errorf("ConsumerName = %q, want override value", cfg.ConsumerName)
+	if cfg.ConsumerName() != "worker-under-test" {
+		t.Errorf("ConsumerName = %q, want override value", cfg.ConsumerName())
 	}
 	if cfg.BlockTimeout != 2*time.Second {
 		t.Errorf("BlockTimeout = %v, want 2s", cfg.BlockTimeout)
