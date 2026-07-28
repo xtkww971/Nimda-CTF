@@ -35,9 +35,9 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("starting judge worker",
-		"consumerName", cfg.ConsumerName,
-		"streamKey", cfg.StreamKey,
-		"consumerGroup", cfg.ConsumerGroup,
+		"consumerName", cfg.ConsumerName(),
+		"streamKey", cfg.StreamKey(),
+		"consumerGroup", cfg.ConsumerGroup(),
 	)
 
 	if cfg.PprofAddr != "" {

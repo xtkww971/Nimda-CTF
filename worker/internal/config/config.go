@@ -17,10 +17,13 @@ type Config struct {
 	RedisDB       int
 
 	// Consumer group topology - must match the producer (nimda-cite backend).
-	StreamKey           string
-	ConsumerGroup       string
-	ConsumerName        string
-	DeadLetterStreamKey string
+	// Unexported and only reachable through the getters below so every
+	// read goes through one place - see the getter docs for what each
+	// value means and why the producer must agree on it.
+	streamKey           string
+	consumerGroup       string
+	consumerName        string
+	deadLetterStreamKey string
 
 	// Read loop tuning
 	BatchSize    int64
@@ -42,6 +45,12 @@ type Config struct {
 	PprofAddr string
 }
 
+// getter
+func (c Config) StreamKey() string           { return c.streamKey }
+func (c Config) ConsumerGroup() string       { return c.consumerGroup }
+func (c Config) ConsumerName() string        { return c.consumerName }
+func (c Config) DeadLetterStreamKey() string { return c.deadLetterStreamKey }
+
 func Load() (Config, error) {
 	consumerName := getEnv("CONSUMER_NAME", "")
 	if consumerName == "" {
@@ -57,10 +66,10 @@ func Load() (Config, error) {
 		RedisPassword: getEnv("REDIS_PASSWORD", ""),
 		RedisDB:       getEnvInt("REDIS_DB", 0),
 
-		StreamKey:           getEnv("JUDGE_QUEUE_STREAM_KEY", "judge:submissions"),
-		ConsumerGroup:       getEnv("JUDGE_QUEUE_CONSUMER_GROUP", "judge-workers"),
-		ConsumerName:        consumerName,
-		DeadLetterStreamKey: getEnv("JUDGE_QUEUE_DEAD_LETTER_STREAM_KEY", "judge:submissions:dead-letter"),
+		streamKey:           getEnv("JUDGE_QUEUE_STREAM_KEY", "judge:submissions"),
+		consumerGroup:       getEnv("JUDGE_QUEUE_CONSUMER_GROUP", "judge-workers"),
+		consumerName:        consumerName,
+		deadLetterStreamKey: getEnv("JUDGE_QUEUE_DEAD_LETTER_STREAM_KEY", "judge:submissions:dead-letter"),
 
 		BatchSize:    getEnvInt64("JUDGE_QUEUE_BATCH_SIZE", 10),
 		BlockTimeout: getEnvDuration("JUDGE_QUEUE_BLOCK_TIMEOUT", 5*time.Second),

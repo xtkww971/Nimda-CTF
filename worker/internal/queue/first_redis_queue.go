@@ -15,9 +15,10 @@ type RedisQueue struct {
 	client *redis.Client
 	// 채널을 외부에서도 접근할 수 있게 설정
 	Channel chan SubmissionMessage
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // 생성자

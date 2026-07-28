@@ -41,7 +41,7 @@ func NewConsumer(rdb *redis.Client, cfg config.Config, handler Handler, log *slo
 // The producer (backend-spring) also does this on startup, so either side
 // coming up first is fine.
 func (c *Consumer) EnsureGroup(ctx context.Context) error {
-	err := c.rdb.XGroupCreateMkStream(ctx, c.cfg.StreamKey, c.cfg.ConsumerGroup, "0").Err()
+	err := c.rdb.XGroupCreateMkStream(ctx, c.cfg.StreamKey(), c.cfg.ConsumerGroup(), "0").Err()
 	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
 		return err
 	}
@@ -62,9 +62,9 @@ func (c *Consumer) Run(ctx context.Context) {
 		}
 
 		streams, err := c.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    c.cfg.ConsumerGroup,
-			Consumer: c.cfg.ConsumerName,
-			Streams:  []string{c.cfg.StreamKey, ">"},
+			Group:    c.cfg.ConsumerGroup(),
+			Consumer: c.cfg.ConsumerName(),
+			Streams:  []string{c.cfg.StreamKey(), ">"},
 			Count:    c.cfg.BatchSize,
 			Block:    c.cfg.BlockTimeout,
 		}).Result()
@@ -79,7 +79,7 @@ func (c *Consumer) Run(ctx context.Context) {
 				return
 			}
 			if strings.Contains(err.Error(), "NOGROUP") {
-				c.log.Warn("consumer group missing, recreating", "stream", c.cfg.StreamKey, "group", c.cfg.ConsumerGroup)
+				c.log.Warn("consumer group missing, recreating", "stream", c.cfg.StreamKey(), "group", c.cfg.ConsumerGroup())
 				if gerr := c.EnsureGroup(ctx); gerr != nil {
 					c.log.Error("failed to recreate consumer group", "error", gerr)
 				}
@@ -152,9 +152,9 @@ func (c *Consumer) reclaimLoop(ctx context.Context) {
 		}
 
 		claimed, next, err := c.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
-			Stream:   c.cfg.StreamKey,
-			Group:    c.cfg.ConsumerGroup,
-			Consumer: c.cfg.ConsumerName,
+			Stream:   c.cfg.StreamKey(),
+			Group:    c.cfg.ConsumerGroup(),
+			Consumer: c.cfg.ConsumerName(),
 			MinIdle:  c.cfg.MinIdleTime,
 			Start:    cursor,
 			Count:    50,
@@ -188,8 +188,8 @@ func (c *Consumer) reclaimLoop(ctx context.Context) {
 // worker restarts instead of being tracked only in local memory.
 func (c *Consumer) deliveryCount(ctx context.Context, id string) int64 {
 	pending, err := c.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
-		Stream: c.cfg.StreamKey,
-		Group:  c.cfg.ConsumerGroup,
+		Stream: c.cfg.StreamKey(),
+		Group:  c.cfg.ConsumerGroup(),
 		Start:  id,
 		End:    id,
 		Count:  1,
@@ -216,7 +216,7 @@ func (c *Consumer) deadLetter(ctx context.Context, xmsg redis.XMessage, cause er
 	fields["deliveryCount"] = deliveries
 
 	if err := c.rdb.XAdd(ctx, &redis.XAddArgs{
-		Stream: c.cfg.DeadLetterStreamKey,
+		Stream: c.cfg.DeadLetterStreamKey(),
 		Values: fields,
 	}).Err(); err != nil {
 		c.log.Error("failed to write to dead-letter stream, original entry will remain pending",
@@ -225,7 +225,7 @@ func (c *Consumer) deadLetter(ctx context.Context, xmsg redis.XMessage, cause er
 }
 
 func (c *Consumer) ack(ctx context.Context, id string) {
-	if err := c.rdb.XAck(ctx, c.cfg.StreamKey, c.cfg.ConsumerGroup, id).Err(); err != nil {
+	if err := c.rdb.XAck(ctx, c.cfg.StreamKey(), c.cfg.ConsumerGroup(), id).Err(); err != nil {
 		// The message was already processed (or dead-lettered); if XACK
 		// itself fails (e.g. Redis dropped the connection at this exact
 		// moment) the entry simply stays pending and reclaimLoop will pick
