@@ -8,6 +8,9 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	// 테스트 환경에서 .env 읽어오기 위해 사용
+	"github.com/joho/godotenv"
 )
 
 type Config struct {
@@ -58,6 +61,8 @@ func (c Config) ConsumerName() string        { return c.consumerName }
 func (c Config) DeadLetterStreamKey() string { return c.deadLetterStreamKey }
 
 func Load() (Config, error) {
+	// 로컳 환경에서 .env 폴더 탐색(테스트 환경에서만 사용함)
+	loadDotEnv(".env", "../.env", "../../.env", "../../../.env")
 	consumerName := getEnv("CONSUMER_NAME", "")
 	if consumerName == "" {
 		host, err := os.Hostname()
@@ -100,6 +105,20 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// loadDotEnv loads the first candidate file that exists. godotenv.Load itself
+// stops at the first candidate it can't find, so passing multiple fallback
+// paths straight to it never reaches the later ones - the test binary's cwd
+// is the package dir (e.g. internal/awsUtil), not the module root, so ".env"
+// alone would never resolve without this walk-and-pick-first logic.
+func loadDotEnv(candidates ...string) {
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err == nil {
+			_ = godotenv.Load(path)
+			return
+		}
+	}
 }
 
 func getEnv(key, fallback string) string {
