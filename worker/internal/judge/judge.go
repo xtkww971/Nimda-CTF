@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"judge-server/internal/isolate"
+	"nimda-judge-worker/internal/isolate"
 )
 
 // sigXFSZ는 리눅스(x86/x86_64 및 대부분 아키텍처)에서 SIGXFSZ(파일 크기 제한 초과) 시그널 번호입니다.
