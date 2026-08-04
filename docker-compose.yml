@@ -1,0 +1,32 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  executor:
+    build:
+      context: .
+      dockerfile: executor/Dockerfile
+    volumes:
+      - judge-socket:/var/run/judge
+    environment:
+      - EXECUTOR_SOCKET_PATH=/var/run/judge/executor.sock
+    # 아직 세부 권한 설정은 하지 않고 테스트용으로 true로 설정
+    privileged: true
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    volumes:
+      - judge-socket:/var/run/judge
+    environment:
+      - REDIS_ADDR=redis:6379
+      - EXECUTOR_SOCKET_PATH=/var/run/judge/executor.sock
+    depends_on:
+      - redis
+      - executor
+
+volumes:
+  judge-socket:
