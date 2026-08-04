@@ -52,6 +52,11 @@ type Config struct {
 	// pprof exposes call stacks/memory contents, so it must never be bound
 	// to a non-loopback address outside a developer's own machine.
 	PprofAddr string
+
+	// ExecutorSocketPath is the unix socket the Executor process (ADR-0005)
+	// listens on. Orchestrator dials this per submission to run a
+	// Start/Run/End session instead of shelling out to isolate itself.
+	ExecutorSocketPath string
 }
 
 // getter
@@ -98,6 +103,8 @@ func Load() (Config, error) {
 		ReconnectMaxDelay:  getEnvDuration("JUDGE_QUEUE_RECONNECT_MAX_DELAY", 30*time.Second),
 
 		PprofAddr: getEnv("PPROF_ADDR", ""),
+
+		ExecutorSocketPath: getEnv("EXECUTOR_SOCKET_PATH", "/var/run/judge/executor.sock"),
 	}
 
 	if cfg.MaxDeliveries < 1 {
