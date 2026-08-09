@@ -1,0 +1,15 @@
+# Standalone Redis for local worker development/testing - independent of
+# "debuging tool for window/" (which wires up the full web+judge stack).
+# This lets you run/debug the worker alone (VSCode debugger, `go test`,
+# manual redis-cli pokes) without starting the Spring backend at all.
+#
+# Bound to 6380 (not the default 6379) so it never collides with the
+# nimda-redis-dev container from the other compose file.
+#
+# Usage: scripts\redis-up.bat / scripts\redis-down.bat
+services:
+  judge-worker-redis-test:
+    image: redis:7-alpine
+    container_name: judge-worker-redis-test
+    ports:
+      - "6380:6379"

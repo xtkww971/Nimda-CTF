@@ -4,29 +4,17 @@ services:
     ports:
       - "6379:6379"
 
-  executor:
+  # Provisioner: 비특권. 큐를 소비해 문제 인스턴스 수명주기를 관리한다.
+  # 현재는 StubHandler(no-op)가 붙어 있어 메시지를 로그로만 남긴다.
+  #
+  # 특권 프로세스(Agent - 컨테이너 런타임 API 호출 담당)는 T3에서 추가한다.
+  # ADR-0007 D5에 따라 Provisioner와는 유닉스 소켓으로만 통신하며,
+  # 이미지/마운트/네트워크는 Agent 내부 화이트리스트에서만 결정한다.
+  provisioner:
     build:
       context: .
-      dockerfile: executor/Dockerfile
-    volumes:
-      - judge-socket:/var/run/judge
-    environment:
-      - EXECUTOR_SOCKET_PATH=/var/run/judge/executor.sock
-    # 아직 세부 권한 설정은 하지 않고 테스트용으로 true로 설정
-    privileged: true
-
-  worker:
-    build:
-      context: .
-      dockerfile: worker/Dockerfile
-    volumes:
-      - judge-socket:/var/run/judge
+      dockerfile: provisioner/Dockerfile
     environment:
       - REDIS_ADDR=redis:6379
-      - EXECUTOR_SOCKET_PATH=/var/run/judge/executor.sock
     depends_on:
       - redis
-      - executor
-
-volumes:
-  judge-socket:
