@@ -1,152 +1,383 @@
-# 채점 로직 구현 — 역할 분담 & 학습 로드맵 (최적화 / 보안)
+# nimda CTF 서버 — 학습 계획 및 구현 일정 (문제 분류 중심)
 
-`docs/go-onboarding.md`(구조 파악), `docs/go-redis-study-guide.md`(Go/Redis 학습 자료)를
-바탕으로, 실제 채점 로직(`worker/internal/judge/handler.go`의 `StubHandler` 대체) 구현을
-**최적화 담당 1명 + 보안 담당 1명**으로 나눠 진행하기 위한 역할 분담과 로드맵이다.
-둘 다 Go로 채점 로직을 짜지만, **모듈 경계를 인터페이스로 명확히 나눠 코드가 겹치지 않게** 설계했다.
+* **최초 작성일:** 2026-08-09
+* **개발 인원:** 1명 (백엔드 개발자, **CTF 경험 없음**)
+* **운영 형태:** **상시 워게임** (Dreamhack 스타일 — 문제 상시 공개, 아무 때나 풀이)
+* **이용 규모:** nimda 동아리 내부, 수십 명 (동시 인스턴스 10~20개 수준)
+* **다룰 수 있는 것:** Java/Spring, Go, Docker
+* **근거 문서:** [ADR-0007](<./adr/[ADR-0007] 알고리즘 채점 서버에서 CTF 문제 서버로의 전환.md>), `work\CTF\00-개발자의 생각.txt`
 
----
-
-## 1. 겹치지 않게 나누는 방법: 인터페이스 경계선
-
-채점 파이프라인을 하나의 인터페이스로 쪼개면, 두 사람이 **서로의 구현을 몰라도** 각자
-작업할 수 있다.
-
-```go
-// internal/judge/executor 패키지 (보안 담당이 구현)
-type Executor interface {
-    // 격리된 환경에서 명령 하나를 실행하고 결과(stdout/stderr/exit code/실제 사용 시간·메모리)를 반환.
-    // 자원 제한·타임아웃·격리는 이 안에서 전부 책임진다.
-    Run(ctx context.Context, cmd Command, limits ResourceLimits) (*ExecResult, error)
-}
-```
-
-```go
-// internal/judge 패키지의 파이프라인 (최적화 담당이 구현)
-// Executor 인터페이스만 알면 되고, 내부에서 cgroups/네임스페이스를 어떻게 쓰는지는 몰라도 됨.
-func (p *Pipeline) Handle(ctx context.Context, msg *queue.SubmissionMessage) error {
-    testcase := p.fetcher.Fetch(ctx, msg.ProblemID)     // 최적화 담당: S3 다운로드/캐싱
-    result := p.executor.Run(ctx, buildCmd(msg), limits) // 보안 담당의 Executor 호출만 함
-    p.callback.Report(ctx, msg.SubmissionID, result)     // 최적화 담당: 결과 콜백 HTTP
-}
-```
-
-**이 인터페이스(`Executor`, `Command`, `ResourceLimits`, `ExecResult` 타입)만 회의에서
-먼저 합의**해두면, 그 다음부터는 각자 폴더 안에서 독립적으로 작업 가능:
-
-| 폴더/파일 | 담당 | 내용 |
-|---|---|---|
-| `internal/judge/executor/` (신규) | **보안 담당** | 샌드박스 실행기 — 여기가 메인 작업 공간 |
-| `internal/judge/fetch/` (신규) | **최적화 담당** | S3 다운로드 + tmpfs 캐싱 |
-| `internal/judge/callback/` (신규) | **최적화 담당** | 결과 콜백 HTTP 클라이언트 (재시도/타임아웃) |
-| `internal/judge/handler.go` | **공동 소유** (오케스트레이션만, 로직 없음) | 위 세 조각을 순서대로 호출하는 얇은 코드 |
-| `internal/queue/` (기존) | **최적화 담당** | 스트림 트리밍 등 큐 최적화 추가 시 |
-| `worker/Dockerfile` (신규) | **보안 담당** | non-root, capability drop 등 하드닝 우선 (최적화 담당은 빌드 캐시/이미지 크기 피드백만) |
-| Redis ACL/`requirepass` 설정 | **보안 담당** | `redis.conf`/운영 스크립트 레벨, Go 코드와 별개 |
-| `internal/config/config.go`의 배치/타임아웃 튜닝 | **최적화 담당** | 기존 파일이지만 값 튜닝만 하므로 충돌 낮음 |
-
-→ 실질적으로 **파일 단위로 겹치는 지점이 없다.** 유일하게 함께 정할 것은 `Executor`
-인터페이스의 시그니처 — 이건 첫 회의에서 30분만 투자해서 합의하면 됨.
+> **이 문서는 개발자 본인의 설계 방향을 그대로 따른다:**
+> *"문제 분류에 대한 이해 → 문제 추가 → 접근 API → 거기에 맞는 모듈"*
+>
+> 이전 버전(인프라 Phase 중심)을 문제 분류 중심으로 재편했다. 파일명은 경로 유지를 위해
+> `team-role-roadmap.md`이지만 팀 분담 문서가 아니다.
 
 ---
 
-## 2. 최적화 담당 (백엔드 개발자) 로드맵
+## 0. 먼저 짚을 것 두 가지
 
-### 2.1 왜 이 사람이 이 영역인가
-백엔드 개발자는 이미 Spring 쪽에서 I/O, 동시성, 큐 연동 감각이 있으므로, **채점 파이프라인의
-처리량과 자원 재사용**을 다루는 쪽이 기존 역량과 가장 잘 맞는다.
+### 0.1 "고도화·세분화해야 할 것 같다"는 막연함 — 절반만 맞다
 
-### 2.2 공부할 것 (우선순위 순)
-1. **Go 동시성 패턴**: goroutine, channel, worker pool (`go-redis-study-guide.md` 2.2절)
-   → [Go Concurrency Patterns](https://go.dev/blog/pipelines)
-2. **context.Context**: 타임아웃/취소 전파 — Executor 호출 시 반드시 필요
-   → [Go blog: Context](https://go.dev/blog/context)
-3. **AWS S3 Go SDK** (`aws-sdk-go-v2`): 테스트케이스 다운로드
-   → [AWS SDK for Go v2 문서](https://aws.github.io/aws-sdk-go-v2/docs/)
-4. **tmpfs 캐싱 개념** (ADR-0002가 이미 요구): 최초 1회 다운로드 후 메모리 속도로 접근
-   → [Linux tmpfs 커널 문서](https://www.kernel.org/doc/html/latest/filesystems/tmpfs.html)
-5. **Redis Streams 최적화**: `XTRIM`/`MAXLEN`, `XREADGROUP` COUNT/BLOCK 튜닝
-   → `go-redis-study-guide.md` 4절, [XADD](https://redis.io/docs/latest/commands/xadd/)
-6. **pprof 프로파일링 + 벤치마크 테스트** (`testing.B`)
-   → [Profiling Go Programs](https://go.dev/blog/pprof)
-7. **Docker 멀티스테이지 빌드** (이미지 경량화 관점)
-   → [Docker multi-stage builds](https://docs.docker.com/build/building/multi-stage/)
+개발자 노트의 걱정을 정확히 나누면:
 
-### 2.3 구현 테스크
-- [ ] `internal/judge/fetch`: S3에서 테스트케이스(Input/Output) 다운로드 클라이언트
-- [ ] tmpfs 기반 로컬 캐싱 (문제 ID 기준, 최초 1회 다운로드 후 재사용)
-- [ ] `internal/judge/callback`: 결과 콜백 HTTP 클라이언트 (`POST /api/judge/submission/result`,
-      재시도/타임아웃/connection 재사용)
-- [ ] `internal/queue`에 스트림 트리밍 로직 추가 (`XADD ... MAXLEN ~ N` 또는 별도 배치)
-- [ ] `config.go`의 `BatchSize`/`BlockTimeout`/`ClaimInterval` 실측 기반 튜닝
-- [ ] `worker/Dockerfile` 멀티스테이지 빌드 (보안 담당의 하드닝 요구사항 반영해서 같이 리뷰)
-- [ ] pprof로 파이프라인 프로파일링 + 벤치마크 테스트 작성
-- [ ] 여러 컨슈머 프로세스로 수평 확장 부하 테스트 (같은 그룹, 다른 컨슈머 이름)
+* **리버싱·포렌식·정적 크립토 문제는 고도화가 전혀 필요 없다.**
+  서버가 하는 일은 **파일 다운로드 + 문자열 비교**가 전부다. 알고리즘 채점(컴파일·샌드박스·
+  출력비교)보다 **훨씬 단순하다.** 이미 nimda.kr에 S3 연동과 다운로드가 있으니 사실상
+  스키마와 검증 API만 붙이면 된다.
+* **고도화가 필요한 건 pwn과 web 딱 두 분류다.** 그것도 "복잡한 채점 로직"이 아니라
+  **살아있는 컨테이너를 사용자별로 띄우고 회수하는 일**이다.
 
----
+→ **막연한 두려움 때문에 처음부터 인프라를 크게 잡으면 안 된다.** 특히 이번 규모
+(동아리 내부 수십 명, 동시 인스턴스 10~20개)에서는 **과잉설계가 실제 리스크**다.
+Kubernetes, 멀티 호스트, 자체 스케줄러는 전부 불필요하다.
 
-## 3. 보안 담당 로드맵
+### 0.2 이 프로젝트의 1순위 리스크는 인프라가 아니라 도메인 이해다
 
-### 3.1 왜 이 영역이 중요한가
-채점 서버는 **신뢰할 수 없는 사용자 코드를 실제로 실행**하는 유일한 컴포넌트다. 이 프로젝트에서
-가장 실패 비용이 큰 부분(호스트 침해, 다른 사용자 코드/데이터 유출)이 여기서 발생한다.
+노트에 쓴 그대로다 — *"가장 큰 문제는 CTF 문제 추가와 푸는 입장을 이해하는 것"*.
+이건 정확한 자기진단이고, 로드맵도 여기에 맞춰야 한다.
 
-### 3.2 공부할 것 (우선순위 순)
-1. **`os/exec` 안전한 사용법**: 셸을 거치지 않는 인자 배열 전달, 커맨드 인젝션 방지
-   → [os/exec 공식 문서](https://pkg.go.dev/os/exec)
-2. **프로세스 격리 기초**: `syscall.SysProcAttr`, 프로세스 그룹 kill (타임아웃 시 자식까지 전부 종료)
-   → [Go syscall.SysProcAttr](https://pkg.go.dev/syscall#SysProcAttr)
-3. **Linux 자원 제한**: cgroups v2 (CPU/메모리/PID 수 상한)
-   → [cgroups v2 커널 문서](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)
-4. **Linux 네임스페이스**: mount/pid/net/user 네임스페이스로 파일시스템/프로세스/네트워크 격리
-   → [Linux namespaces(7)](https://man7.org/linux/man-pages/man7/namespaces.7.html)
-5. **기존 샌드박스 도구 조사 및 선택**: isolate / nsjail / gVisor 비교, 하나 골라 로컬에서 직접 실행해보기
-   → [isolate](https://github.com/ioi/isolate), [nsjail](https://github.com/google/nsjail)
-6. **seccomp 개념** (화이트리스트 밖 syscall 차단) — 최소한 개념만, 직접 구현보다 기존 도구 활용 우선
-   → [seccomp(2)](https://man7.org/linux/man-pages/man2/seccomp.2.html)
-7. **Redis 보안**: ACL 최소 권한 분리, `requirepass`, 위험 명령어 제한
-   → [Redis ACL 공식 문서](https://redis.io/docs/latest/operate/oss_and_stack/management/security/acl/)
-8. **Docker 컨테이너 하드닝**: non-root 유저, capability drop, read-only 파일시스템
-   → [Docker security 공식 문서](https://docs.docker.com/engine/security/)
-9. **govulncheck**: 의존성 취약점 점검 습관화
-   → [Go blog: govulncheck](https://go.dev/blog/vuln)
+**왜 치명적인가:** CTF를 모르면 *"문제 하나를 서비스한다"* 는 게 무슨 뜻인지 모르는 상태로
+API를 설계하게 된다. 예를 들어 아래 사실을 모르면 pwn 문제 API를 잘못 만든다.
 
-### 3.3 구현 테스크
-- [ ] `internal/judge/executor`: `Executor` 인터페이스 구현 — 자원 제한 + 격리 + 타임아웃 강제 kill
-- [ ] 언어별 컴파일/실행 커맨드의 안전한 조립 (`language` 화이트리스트 검증, 인자 배열 조립)
-- [ ] 작업 디렉토리 격리 + 경로 순회 방지 (`filepath.Clean`, 임시 디렉토리 정리)
-- [ ] isolate(또는 선택한 도구)를 Go에서 `os/exec`로 감싸는 wrapper 구현 및 검증
-- [ ] Redis ACL 설정: producer는 `XADD`/`XGROUP CREATE`만, consumer는 `XREADGROUP`/`XACK`/
-      `XCLAIM`/`XAUTOCLAIM`/dead-letter `XADD`만 허용하도록 최소 권한 분리
-- [ ] `worker/Dockerfile` 하드닝 (non-root 유저, 불필요 바이너리 제거)
-- [ ] 악성/포이즌 입력 테스트: 초과 크기 `sourceCode`, 잘못된 `language`, 무한루프/포크폭탄
-      시나리오를 Executor 격리 안에서 실행해 실제로 격리되는지 검증
-- [ ] 결과 콜백 요청의 위·변조 방지 검토 (백엔드 팀과 협의 — 워커→백엔드 콜백 인증 방식)
+> **pwn 문제는 "원격 셸 획득"이 목표다.** 즉 참가자가 성공하면 그 컨테이너 안에서
+> 명령을 실행할 수 있게 된다. 그러면 **플래그 파일을 지우거나 서비스를 죽일 수도 있다.**
+> → 공용 컨테이너 하나로 pwn 문제를 내면, **한 명이 다른 모두의 문제를 망칠 수 있다.**
+> → 그래서 pwn은 **사용자별 인스턴스가 사실상 필수**다.
+
+이런 건 문서를 읽어서가 아니라 **직접 풀어보면 30분 만에 이해된다.** 그래서 §2의 학습
+계획은 "책 읽기"가 아니라 **직접 풀고, 직접 등록해보고, 경험자에게 묻는 것** 위주다.
 
 ---
 
-## 4. 주차별 로드맵 (학습 + 구현 병행)
+## 1. 문제 분류 이해 (설계의 출발점)
 
-두 사람 다 "학습만 하고 나중에 구현"이 아니라 **매주 학습과 구현을 병행**하는 것을 권장한다
-(Go는 튜토리얼보다 실제 코드를 읽고 고치면서 느는 속도가 훨씬 빠름).
+### 1.1 분류별 — 푸는 입장 / 내는 입장 / 서버가 할 일
 
-| 주차 | 최적화 담당 | 보안 담당 | 공동 |
+| 분류 | 참가자가 하는 일 (푸는 입장) | 출제자가 준비하는 것 (내는 입장) | **서버가 제공해야 하는 것** |
 |---|---|---|---|
-| **1주차** | Go 동시성/context 학습 + `fetch` 패키지 골격 작성 | `os/exec`/cgroups/네임스페이스 학습 + isolate/nsjail 로컬 실습 | 회의에서 `Executor` 인터페이스 시그니처 합의 |
-| **2주차** | S3 다운로드 + tmpfs 캐싱 구현, 유닛 테스트 | `Executor` 구현 착수 (자원 제한 + 격리, 우선 단일 언어로 PoC) | 중간 체크: Executor PoC로 파이프라인 연결 테스트 |
-| **3주차** | 결과 콜백 클라이언트 + 스트림 트리밍 구현 | 언어별 컴파일/실행 커맨드 조립 + 악성 입력 테스트 작성 | `handler.go` 오케스트레이션 코드 함께 리뷰 |
-| **4주차** | pprof 프로파일링, 부하 테스트, Dockerfile 이미지 최적화 | Redis ACL 적용, Dockerfile 하드닝, govulncheck 점검 | 통합 테스트 (전체 채점 플로우 end-to-end), ADR 작성(샌드박스 도구 선택 근거 등) |
+| **Reversing** | 실행파일을 디컴파일해서 로직 역산, 정답 입력값 찾기 | 바이너리 파일 1개 | 파일 배포 + 플래그 검증 |
+| **Forensics** | pcap·디스크덤프·이미지에서 흔적 찾기 | 증거 파일 (수십~수백 MB) | 파일 배포 + 플래그 검증 (**대용량**) |
+| **Crypto (정적)** | 암호문 + 암호화 스크립트를 받아 수학적으로 공격 | 스크립트 + 출력 파일 | 파일 배포 + 플래그 검증 |
+| **Misc** | 잡다 (스테가노그래피, OSINT, 프로그래밍) | 파일 또는 서비스 | 위와 같거나 아래와 같음 |
+| **Web** | 웹 취약점 공격 (SQLi, XSS, SSRF, 인증우회) | **동작하는 웹 애플리케이션** | **살아있는 HTTP 서비스** |
+| **Crypto (인터랙티브)** | 서버에 질의를 반복해 키 추출 (오라클 공격) | **동작하는 TCP 서비스** | **살아있는 TCP 서비스** |
+| **Pwn (시스템)** | 바이너리 취약점으로 **원격 셸 획득** | 바이너리 + **동작하는 TCP 서비스** | **살아있는 TCP + 강한 격리 + 개인 인스턴스** |
 
-> 트래픽/일정에 따라 주차는 늘어날 수 있음. 핵심은 **1주차에 인터페이스를 먼저 고정**하는
-> 것 — 이게 늦어지면 이후 병렬 작업이 막힌다.
+### 1.2 핵심 통찰: 분류는 곧 인프라 요구사항이다
+
+CTF 분류는 **"참가자가 무엇과 상호작용하는가"** 로 나뉜다. 그리고 그게 **그대로 서버가
+제공해야 하는 것**이다. 그래서 개발자 노트의 *"분류별로 구현 방식을 다르게 가져가서
+하나씩 추가"* 라는 접근은 **인프라 관점에서도 정확히 옳다.** 우연이 아니다.
+
+요구사항으로 정리하면 딱 **3단계 계단**이 된다.
+
+```
+T1  파일 배포형          참가자 ──다운로드──▶ S3          [서버: 정적 파일 + 플래그 비교]
+    리버싱/포렌식/정적크립토                                 ↑ 이미 nimda.kr에 있음
+
+T2  공용 서비스형        참가자 ──HTTP/TCP──▶ 컨테이너 1개  [서버: 상시 컨테이너 + 노출]
+    무상태 web/인터랙티브 크립토                              ↑ 전원이 같은 인스턴스 공유
+
+T3  개인 인스턴스형      참가자 ──HTTP/TCP──▶ 내 전용 컨테이너 [서버: 온디맨드 생성 + TTL 회수]
+    pwn / 상태있는 web                                        ↑ 격리 + 자원 회수가 핵심
+```
+
+**T1 → T2 → T3 순서로 구현한다.** 각 단계가 끝나면 **그 분류의 문제를 실제로 서비스할 수
+있는 상태**가 되고, 뒤 단계를 안 해도 앞 단계는 계속 동작한다.
+
+### 1.3 T2 vs T3를 가르는 기준 (출제 시 판단해야 함)
+
+문제를 등록할 때 "공용으로 낼지 개인 인스턴스로 낼지"를 정해야 한다. 기준은 하나다.
+
+> **"한 사람이 이 문제를 풀면, 다른 사람의 풀이에 영향을 주는가?"**
+
+| 영향 있음 → **T3 (개인 인스턴스)** | 영향 없음 → **T2 (공용)** |
+|---|---|
+| pwn — 셸을 잡아 파일 삭제·서비스 종료 가능 | 읽기 전용 web (소스 노출, 정보 유출형) |
+| DB에 쓰는 web (SQLi로 데이터 오염) | 상태 없는 로직 우회 문제 |
+| 파일 업로드 web (웹셸 업로드 가능) | 순수 계산형 인터랙티브 크립토 |
+| 재시작해야 초기화되는 문제 | |
+
+→ 이 판단을 `challenge.yml`의 필드 하나(`isolation: shared | per-user`)로 표현한다.
+
+### 1.4 이번 규모에서 확정되는 것 (상시 워게임 · 수십 명)
+
+| 항목 | 결정 | 이유 |
+|---|---|---|
+| Kubernetes | **안 씀** | 동시 인스턴스 10~20개. 단일 호스트로 10배 여유 |
+| 인스턴스 단위 | **사용자별** (팀 아님) | 동아리 내부 상시 워게임이라 팀 개념 없음 |
+| **TTL 회수** | **필수·최우선** | **상시 운영이라 인스턴스가 새면 영원히 샌다.** 대회는 끝나면 다 지우면 되지만 여기는 끝이 없음 |
+| 동적 점수·퍼스트블러드 | **안 함 (당분간)** | 대회 기능. 상시 워게임엔 정적 점수가 자연스러움 |
+| 대회 모드(기간·프리즈) | **나중에** | 필요해지면 그때 |
+| 동적 플래그(사용자별 HMAC) | **T3에서만** | T1 파일 문제는 플래그가 파일 안에 박혀 있어 어차피 고정 |
 
 ---
 
-## 5. 회의에서 반드시 정하고 가야 할 것
+## 2. 학습 계획 — "CTF를 모른다"를 가장 빨리 해소하는 순서
 
-1. `Executor` 인터페이스 시그니처 (입력: 명령/자원제한, 출력: 실행결과) — 위 1절 초안 기준으로 확정
-2. 샌드박스 도구 선택 여부 (isolate vs nsjail vs 직접 구현) — 보안 담당이 후보 조사해오고,
-   결정되면 반드시 새 ADR로 기록 (`docs/adr/` 네이밍 규칙 참고: `NNNN-영문-소문자-케밥.md`)
-3. 언어 지원 우선순위 (JAVA/PYTHON3/CPP/C 중 어떤 언어부터 PoC를 만들지)
-4. 두 모듈(Executor ↔ 나머지 파이프라인) 연결 시점 — 각자 스텁으로 먼저 개발하고 2주차에
-   합치는지, 처음부터 실제 구현으로 붙일지
+> 원칙: **읽지 말고 해본다.** 문서 10시간보다 문제 1개 풀이가 빠르다.
+
+### 2.1 0순위 — 동아리원에게 묻기 (가장 저평가된 자원)
+
+nimda는 **보안 동아리**다. 주변에 CTF 출제·참가 경험자가 있을 가능성이 매우 높고,
+**이 프로젝트의 사용자가 곧 그 사람들**이다.
+
+물어볼 것 (1시간이면 충분, 문서 10시간보다 가치 있음):
+- [ ] "문제 낼 때 제일 귀찮았던 게 뭐예요?" ← **요구사항의 핵심**
+- [ ] "어떤 문제가 개인 인스턴스가 꼭 필요했어요?" ← §1.3 판단 기준 검증
+- [ ] "Dreamhack/CTFd 쓰면서 불편했던 점?" ← 차별점
+- [ ] "문제 파일은 보통 어떻게 구성해요?" (바이너리만? 소스도? Dockerfile?) ← `challenge.yml` 설계
+- [ ] 실제 출제해본 문제 파일 한 세트 받아보기 ← **가장 값진 것**
+
+### 2.2 1순위 — 직접 풀어본다 (푸는 입장 이해)
+
+**[Dreamhack](https://dreamhack.io/wargame)** — 한국어, 무료, 단계별. **우리가 만들려는 것과
+운영 형태가 동일**(상시 워게임)해서 UX 참고까지 된다.
+
+각 분류 최소 1문제씩. 순서가 중요하다:
+
+- [ ] **리버싱 1문제** — 첫 구현 대상. "파일 받아서 푼다"가 뭔지 체감
+- [ ] **포렌식 1문제** — 파일 크기 감각 (수백 MB 다운로드가 어떤 경험인지)
+- [ ] **web 1문제** — "살아있는 서버에 붙는다"의 의미. **인스턴스 버튼**이 어떻게 동작하는지 관찰
+- [ ] **pwn 1문제** ← ***가장 중요.*** 실제로 셸을 잡아보면 §0.2의 "왜 개인 인스턴스가
+      필수인가"를 몸으로 이해한다. 못 풀어도 **write-up을 보고 따라 해보는 것만으로 충분**
+
+> pwn 문제를 풀 때 관찰할 것: 인스턴스 생성 버튼 → 주소·포트 발급 → **만료 시간 표시** →
+> 재시작 버튼. **이게 우리가 T3에서 만들 기능 전부다.**
+
+### 2.3 2순위 — CTFd를 직접 띄워서 문제를 등록해본다 (내는 입장 이해)
+
+```bash
+git clone https://github.com/CTFd/CTFd && cd CTFd && docker compose up
+```
+
+- [ ] 문제 하나 등록 (제목·설명·점수·플래그·첨부파일)
+- [ ] **어드민 화면의 입력 필드를 그대로 적어둔다** ← 우리 Challenge 스키마의 초안
+- [ ] 플래그 타입(정확일치 / 정규식 / 대소문자) 확인
+- [ ] 참가자 화면에서 직접 풀어보기 (제출 → 정오답 → 점수 반영)
+
+> **이게 "문제 추가 API 설계"의 최단 경로다.** 성숙한 플랫폼의 데이터 모델을 역설계하는
+> 것이, 백지에서 스키마를 상상하는 것보다 훨씬 정확하다.
+
+### 2.4 3순위 — 분류별 구현 직전에만 공부 (미리 하지 않는다)
+
+| 언제 | 무엇을 | 왜 그때인가 |
+|---|---|---|
+| **T1 직전** | 상수시간 비교([crypto/subtle](https://pkg.go.dev/crypto/subtle)), presigned URL, rate limit | 플래그 검증에 바로 필요 |
+| **T2 직전** | Docker 네트워킹, [Traefik Docker provider](https://doc.traefik.io/traefik/providers/docker/), **egress 차단**(iptables `DOCKER-USER`) | 컨테이너 노출 시작 시점 |
+| **T2 직전** | [gVisor 아키텍처](https://gvisor.dev/docs/architecture_guide/) + 설치 | 격리 런타임 도입 시점 |
+| **T3 직전** | [Docker Engine API (Go SDK)](https://pkg.go.dev/github.com/docker/docker/client), 컨테이너 수명주기 | 온디맨드 생성 구현 시점 |
+| **T3 직전** | [컨테이너 이스케이프 기법](https://blog.trailofbits.com/2019/07/19/understanding-docker-container-escapes/) | pwn 도입 = 침해 전제 시작 |
+| **T3 중** | HMAC 동적 플래그, TTL/리퍼 패턴 | 해당 모듈 구현 시 |
+
+**미리 공부하지 않는 이유:** 지금 gVisor를 파봐야 T2까지 몇 주가 남았고 그때쯤 잊는다.
+**isolate 학습이 통째로 무효가 된 경험**을 반복하지 않으려면, 쓰기 직전에 배운다.
+
+### 2.5 기존 학습에서 살아남는 것
+
+isolate 시절 공부가 헛되지 않았다. **namespace / cgroup / capability / seccomp 개념은
+그대로 유효**하고, 적용 대상만 isolate → 컨테이너 런타임으로 바뀐다. T2~T3에서 바로 쓴다.
+반면 tmpfs 테스트케이스 캐싱, 채점 배치 튜닝은 대상이 사라져 폐기다.
+
+---
+
+## 3. 구현 일정
+
+> 각 트랙은 **"그 분류의 문제를 실제로 서비스할 수 있는 상태"** 로 끝난다.
+> WU 번호는 `work\CTF\02_전환-로드맵.md`와 대응한다.
+> 주차는 목표가 아니라 **순서**다 (혼자 + 학습 병행이라 실제 소요는 달라진다).
+
+### 사전 작업 (1주) — 레포 정리
+
+현재 Judge Server 레포는 **빌드되지 않는다** (`go.work`가 없는 `protocol/` 모듈 참조).
+
+| WU | 작업 |
+|---|---|
+| **WU-00** | `archive/isolate-judge` 태그 → 폐기 코드 삭제 → `go.work` 정리 → 빌드 복구 |
+| **WU-01** | `docker-compose.yml`의 `privileged: true` 제거 |
+| **WU-02~03** | ADR-0006 Superseded 표기, README 재작성 |
+
+> 이 주차에 **§2.1(동아리원 인터뷰)과 §2.3(CTFd 띄우기)을 병행**한다. 코드 정리는 머리를
+>많이 안 쓰므로 학습과 붙이기 좋다.
+
+---
+
+### 트랙 T1 — 파일 배포형 (리버싱·포렌식·정적 크립토) · 3~4주
+
+**목표: 리버싱 문제를 실제로 등록하고 동아리원이 풀 수 있다.**
+개발자 노트대로 **가장 먼저 할 수 있는 것** — nimda.kr에 S3 연동·다운로드가 이미 있다.
+
+| 주차 | 학습 | 구현 (대부분 Spring 레포) |
+|---|---|---|
+| 2 | Dreamhack 리버싱·포렌식 각 1문제 / CTFd 어드민 필드 정리 | **WU-10** Challenge·Flag·Solve 스키마 + 마이그레이션 (**스키마 단독**) |
+| 3 | 상수시간 비교, rate limit 패턴 | **WU-11** 플래그 제출·검증 API |
+| 4 | presigned URL 보안 (만료·권한) | **WU-12** rate limit · **WU-13** 첨부파일 배포 |
+| 5 | — | **WU-14** 스코어보드 · **WU-15** 어드민 문제 CRUD |
+
+**T1 완료 기준**
+- [ ] 어드민이 문제를 등록하고 파일을 올릴 수 있다
+- [ ] 참가자가 파일을 받고, 플래그를 제출하면 즉시 정오답이 나온다
+- [ ] 스코어보드에 반영된다
+- [ ] **실제 리버싱 문제 1개가 서비스되고 있다**
+
+> **Judge Server 레포(Go)는 이 트랙에서 거의 쓰이지 않는다.** 첨부파일 presigned URL을
+> Spring이 직접 발급하면 `awsUtil`도 안 쓴다. 정상이다 — Go 쪽은 T2부터 일한다.
+
+---
+
+### 트랙 T2 — 공용 서비스형 (무상태 web · 인터랙티브 크립토) · 3~4주
+
+**목표: web 문제 컨테이너를 띄우고 참가자가 브라우저로 붙을 수 있다.**
+아직 온디맨드 생성 없음 — **문제당 컨테이너 1개를 수동 배포**한다.
+
+| 주차 | 학습 | 구현 |
+|---|---|---|
+| 6 | Dreamhack web 1문제 / **gVisor 설치·PoC** | **WU-20** gVisor에서 문제 컨테이너가 뜨는지 검증 → **ADR-0008** |
+| 7 | Docker 네트워킹, egress 차단 | **WU-21** `challenge.yml` 포맷 (`isolation` 필드 포함) → **ADR-0012** |
+| 8 | Traefik Docker provider | **WU-22** 이미지 레지스트리 · **WU-23** Traefik 노출 → **ADR-0010** |
+| 9 | — | **WU-24** egress 차단 · **WU-25** 하드닝 기본값 · **WU-26** 수동 배포 runbook |
+
+**T2 완료 기준**
+- [ ] `https://chal-web01.nimda.kr` 형태로 문제에 접속된다
+- [ ] 컨테이너가 gVisor 위에서 뜬다 (`privileged` 없이)
+- [ ] **컨테이너 안에서 외부 인터넷·내부망으로 나갈 수 없다** (직접 검증)
+- [ ] **실제 web 문제 1개가 서비스되고 있다**
+
+> ⚠️ **주차 6이 전체 일정의 병목이다.** gVisor에서 문제 컨테이너가 안 뜨면(일부 syscall
+> 미구현) 격리 런타임을 다시 골라야 하고 이후 설정이 전부 흔들린다. **여기서 막히면
+> 즉시 알려줄 것** — Kata 재검토 또는 gVisor 예외 처리로 방향을 바꿔야 한다.
+
+---
+
+### 트랙 T3 — 개인 인스턴스형 (pwn · 상태있는 web) · 5~6주
+
+**목표: 참가자가 "인스턴스 생성" 버튼을 누르면 전용 컨테이너가 뜨고, TTL이 지나면 회수된다.**
+여기서만 ADR-0007의 권한 분리 구조가 필요하다.
+
+| 주차 | 학습 | 구현 |
+|---|---|---|
+| 10 | **Dreamhack pwn 1문제 (write-up 따라하기라도)** ← *필수* | **WU-30** `protocol/` 프레임 **정의만** · **WU-31** 큐 스키마 **정의만** |
+| 11 | Docker Engine API (Go SDK) | **WU-32** Agent 소켓 서버 골격 (핸들러 스텁) |
+| 12 | **컨테이너 이스케이프 기법** | **WU-33** 이미지 화이트리스트 ← ***단독 작업·재검토 필수*** |
+| 13 | — | **WU-34** Docker API 어댑터 · **WU-35** Provisioner 클라이언트 |
+| 14 | HMAC 플래그 파생, TTL 패턴 | **WU-36~37** 큐 배선 · **WU-39** 주소 할당 · **WU-40** TTL 리퍼 |
+| 15 | — | **WU-38** 동적 플래그 · **WU-41** 쿼터 · **WU-42~43** Spring 인스턴스 API |
+| 16 | — | **WU-46** 격리 검증 · 관측성(메트릭·알람) · **WU-44** runbook |
+
+**T3 완료 기준**
+- [ ] 참가자가 인스턴스를 생성하면 주소·포트와 **만료 시간**을 받는다
+- [ ] TTL이 지나면 자동 회수된다 (**누수 없음 — 상시 운영이라 가장 중요**)
+- [ ] 사용자 A가 사용자 B의 인스턴스에 접근할 수 없다
+- [ ] 사용자별 플래그가 다르다 (공유 시 추적 가능)
+- [ ] **Provisioner가 침해돼도 임의 이미지를 실행할 수 없다** (WU-33 검증)
+- [ ] **실제 pwn 문제 1개가 서비스되고 있다**
+
+> ⚠️ **주차 12의 WU-33이 보안상 가장 중요한 한 지점이다.** Provisioner가 이미지 이름을
+> 지정할 수 있으면 임의 이미지 실행 = 호스트 장악이다. Agent는 `challengeId`만 받고
+> 이미지·마운트·네트워크는 **자기 내부 화이트리스트에서만** 결정해야 한다.
+
+---
+
+### 전체 일정 요약
+
+| 구간 | 기간 | 끝나면 가능한 것 |
+|---|---|---|
+| 사전 정리 | 1주 | 빌드되는 레포 + CTF 감각 |
+| **T1** | 3~4주 | **리버싱·포렌식·크립토 문제 서비스** |
+| **T2** | 3~4주 | **+ 무상태 web 문제** |
+| **T3** | 5~6주 | **+ pwn·상태있는 web 문제** |
+| 합계 | **약 13~15주** | 전 분류 서비스 |
+
+**T1만 끝나도 동아리 워게임을 열 수 있다.** 리버싱·포렌식·크립토만으로도 충분한 문제 수가
+나온다. T2·T3는 필요해질 때 이어붙이면 된다.
+
+---
+
+## 4. 보안 관점 정리 (분류별로 언제 무엇이 필요한가)
+
+혼자 개발하므로 보안을 별도 트랙으로 병렬 진행할 수 없다. 대신 **각 트랙 안에서
+"지금 반드시 해야 할 보안"만** 처리한다. 기준은 **되돌리기 비용**이다.
+
+| 트랙 | **지금 안 하면 나중에 못 끼워넣는 것** | 나중에 조여도 되는 것 |
+|---|---|---|
+| **T1** | 플래그 상수시간 비교, presigned URL 만료 | rate limit 수치 조정 |
+| **T2** | **격리 런타임 선택(gVisor)**, **egress 차단**, 하드닝 기본값 | 문제별 seccomp 완화 |
+| **T3** | **Agent 이미지 화이트리스트**, 인스턴스 간 네트워크 차단 | 쿼터 수치, 동적 플래그 |
+
+**T2의 egress 차단이 가장 실수하기 쉽다.** 문제 컨테이너에서 인터넷이 되면
+SSRF·리버스셸·타 서비스 공격의 발판이 된다. 컨테이너를 처음 노출하는 T2 시점에
+**기본값으로** 막아야 하고, 나중에 추가하려 하면 이미 뜬 문제들을 다 재배포해야 한다.
+
+### 상시 워게임이라서 추가로 신경 쓸 것
+
+* **자원 누수 = 영구 누수.** 대회는 끝나면 전부 정리하지만 워게임은 끝이 없다.
+  TTL 리퍼 실패가 누적되면 몇 주 뒤 호스트가 멈춘다. → 리퍼 실패 알람 필수.
+* **문제가 계속 노출된다.** 대회는 몇 시간이지만 워게임은 상시 공격에 노출된다.
+  → 취약한 문제 이미지 하나가 오래 방치되지 않도록 문제 이미지도 갱신 대상.
+* **혼자 운영한다 = 24시간 볼 수 없다.** → 최소 3개 지표(동시 인스턴스 수 / 리퍼 실패 /
+  자원 사용률)에 알람을 걸어둔다. T3에서 함께 구현.
+
+---
+
+## 5. 기술 스택 (규모 확정 후 재검토 결과)
+
+| 계층 | 선택 | 비고 |
+|---|---|---|
+| API·문제 관리·플래그 검증 | **Spring Boot** | 유지 (ADR-0001). T1은 사실상 이것만 씀 |
+| Provisioner / Agent | **Go** | 유지 (ADR-0003). T3부터 사용 |
+| 인스턴스 큐 | **Redis Streams** | 유지 (ADR-0004), 용도만 변경. **T3부터** |
+| 격리 런타임 | **gVisor (runsc)** | 도입 비용이 "런타임 등록 한 번". T2에서 PoC → ADR-0008 |
+| 오케스트레이션 | **Docker Engine API, 단일 호스트** | **K8s 배제 확정** — 동시 10~20개면 10배 여유 |
+| 주소 노출 | **Traefik**(web) + **포트 풀**(pwn) | raw TCP는 서브도메인 라우팅 불가라 통합 안 됨 |
+| 파일 배포 | **S3** | nimda.kr에 이미 있음 |
+| 관측성 | **Prometheus + Alertmanager** | T3에서. 1인 운영엔 알람이 필수 |
+
+**전부 이미 다룰 수 있는 것(Java/Spring, Go, Docker) 위에 있다.** 새로 배워야 하는
+"프레임워크"는 사실상 **gVisor(설정)와 Traefik(설정)** 둘뿐이고, 둘 다 애플리케이션
+코드가 아니라 인프라 설정이다.
+
+### 이번 규모에서 명시적으로 안 하는 것
+
+Kubernetes · 멀티 호스트 · 샌드박스 자체 구현 · 커스텀 리버스 프록시 ·
+동적 점수/퍼스트블러드 · 실시간 부정행위 탐지.
+**야심을 줄인 게 아니라, 혼자 운영할 수 없는 것을 만들지 않는 것이다.**
+
+---
+
+## 6. 착수 전 확정할 것
+
+| # | 결정할 것 | 막는 것 | 제안 |
+|---|---|---|---|
+| 1 | 디렉토리명 `worker`/`executor` → `provisioner`/`agent` | WU-00 | **변경 권장** (역할이 완전히 달라짐, 지금이 비용 최저) |
+| 2 | 첨부파일 presigned URL을 Spring이 직접 발급? | WU-13 | **Spring 직접** (그러면 T1에 Go 레포 불필요) |
+| 3 | 문제 파일을 nimda.kr 기존 S3 버킷에 둘지 분리할지 | WU-13 | **분리 권장** — 문제 파일은 유출 시 영향이 다름 |
+| 4 | 플래그 포맷 | WU-10 | `nimda{...}` |
+
+---
+
+## 7. 참고자료
+
+**CTF 이해 (0~2순위 학습)**
+* [Dreamhack 워게임](https://dreamhack.io/wargame) — 한국어, 상시 워게임. **우리와 같은 형태**
+* [CTFd](https://github.com/CTFd/CTFd) — 로컬에 띄워 출제자 UI 관찰 (§2.3)
+* [picoCTF](https://picoctf.org/) — 입문용 문제 아카이브
+* [CTF Field Guide](https://trailofbits.github.io/ctf/) — 분류별 개요를 짧게 볼 때
+
+**T2 시점에 볼 것**
+* [gVisor Architecture Guide](https://gvisor.dev/docs/architecture_guide/) / [Docker quick start](https://gvisor.dev/docs/user_guide/quick_start/docker/)
+* [Traefik Docker provider](https://doc.traefik.io/traefik/providers/docker/)
+* [Docker networking](https://docs.docker.com/engine/network/) — egress 차단 (`DOCKER-USER` 체인)
+* [Docker Engine security](https://docs.docker.com/engine/security/)
+
+**T3 시점에 볼 것**
+* [Docker Engine API (Go SDK)](https://pkg.go.dev/github.com/docker/docker/client)
+* [Understanding Docker container escapes](https://blog.trailofbits.com/2019/07/19/understanding-docker-container-escapes/)
+* [kCTF](https://google.github.io/kctf/) — gVisor 기반 CTF 인프라 선례
+* [crypto/hmac](https://pkg.go.dev/crypto/hmac) · [crypto/subtle](https://pkg.go.dev/crypto/subtle)
+* [Prometheus Go client](https://prometheus.io/docs/guides/go-application/)
+
+**프로젝트 내부**
+* [ADR-0007](<./adr/[ADR-0007] 알고리즘 채점 서버에서 CTF 문제 서버로의 전환.md>) — 전환 근거
+* `work\CTF\01_작업-규칙.md` — 모듈 단위 작업 규칙
+* `work\CTF\02_전환-로드맵.md` — WU-xx 상세
