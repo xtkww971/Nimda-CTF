@@ -1,5 +1,3 @@
 go 1.26.1
 
-use ./worker
-use ./executor
-use ./protocol
+use ./provisioner
