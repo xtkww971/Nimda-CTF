@@ -12,11 +12,11 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if cfg.StreamKey() != "judge:submissions" {
-		t.Errorf("StreamKey = %q, want %q", cfg.StreamKey(), "judge:submissions")
+	if cfg.StreamKey() != "ctf:instance:ops" {
+		t.Errorf("StreamKey = %q, want %q", cfg.StreamKey(), "ctf:instance:ops")
 	}
-	if cfg.ConsumerGroup() != "judge-workers" {
-		t.Errorf("ConsumerGroup = %q, want %q", cfg.ConsumerGroup(), "judge-workers")
+	if cfg.ConsumerGroup() != "ctf-provisioners" {
+		t.Errorf("ConsumerGroup = %q, want %q", cfg.ConsumerGroup(), "ctf-provisioners")
 	}
 	if cfg.ConsumerName() == "" {
 		t.Error("ConsumerName should default to hostname-pid, got empty string")
@@ -30,9 +30,9 @@ func TestLoadDefaults(t *testing.T) {
 }
 
 func TestLoadRespectsEnvOverrides(t *testing.T) {
-	t.Setenv("JUDGE_QUEUE_STREAM_KEY", "test:submissions")
+	t.Setenv("CTF_QUEUE_STREAM_KEY", "test:submissions")
 	t.Setenv("CONSUMER_NAME", "worker-under-test")
-	t.Setenv("JUDGE_QUEUE_BLOCK_TIMEOUT", "2s")
+	t.Setenv("CTF_QUEUE_BLOCK_TIMEOUT", "2s")
 	t.Setenv("PPROF_ADDR", "localhost:6060")
 
 	cfg, err := Load()
@@ -55,13 +55,13 @@ func TestLoadRespectsEnvOverrides(t *testing.T) {
 }
 
 func TestLoadRejectsInvalidMaxDeliveries(t *testing.T) {
-	t.Setenv("JUDGE_QUEUE_MAX_DELIVERIES", "0")
+	t.Setenv("CTF_QUEUE_MAX_DELIVERIES", "0")
 
 	_, err := Load()
 	if err == nil {
-		t.Fatal("expected error for JUDGE_QUEUE_MAX_DELIVERIES=0, got none")
+		t.Fatal("expected error for CTF_QUEUE_MAX_DELIVERIES=0, got none")
 	}
-	if !strings.Contains(err.Error(), "JUDGE_QUEUE_MAX_DELIVERIES") {
+	if !strings.Contains(err.Error(), "CTF_QUEUE_MAX_DELIVERIES") {
 		t.Errorf("error message %q does not mention the offending key", err.Error())
 	}
 }

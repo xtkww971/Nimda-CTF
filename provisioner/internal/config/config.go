@@ -33,6 +33,7 @@ type Config struct {
 	consumerGroup       string
 	consumerName        string
 	deadLetterStreamKey string
+	resultStreamKey     string
 
 	// Read loop tuning
 	BatchSize    int64
@@ -64,6 +65,7 @@ func (c Config) StreamKey() string           { return c.streamKey }
 func (c Config) ConsumerGroup() string       { return c.consumerGroup }
 func (c Config) ConsumerName() string        { return c.consumerName }
 func (c Config) DeadLetterStreamKey() string { return c.deadLetterStreamKey }
+func (c Config) ResultStreamKey() string     { return c.resultStreamKey }
 
 func Load() (Config, error) {
 	// 로컳 환경에서 .env 폴더 탐색(테스트 환경에서만 사용함)
@@ -82,25 +84,26 @@ func Load() (Config, error) {
 		RedisPassword: getEnv("REDIS_PASSWORD", ""),
 		RedisDB:       getEnvInt("REDIS_DB", 0),
 
-		streamKey:           getEnv("JUDGE_QUEUE_STREAM_KEY", "judge:submissions"),
-		consumerGroup:       getEnv("JUDGE_QUEUE_CONSUMER_GROUP", "judge-workers"),
+		streamKey:           getEnv("CTF_QUEUE_STREAM_KEY", "ctf:instance:ops"),
+		consumerGroup:       getEnv("CTF_QUEUE_CONSUMER_GROUP", "ctf-provisioners"),
 		consumerName:        consumerName,
-		deadLetterStreamKey: getEnv("JUDGE_QUEUE_DEAD_LETTER_STREAM_KEY", "judge:submissions:dead-letter"),
+		deadLetterStreamKey: getEnv("CTF_QUEUE_DEAD_LETTER_STREAM_KEY", "ctf:instance:ops:dead-letter"),
+		resultStreamKey:     getEnv("CTF_QUEUE_RESULT_STREAM_KEY", "ctf:instance:results"),
 
 		AWSRegion:          getEnv("AWS_S3_REGION", "ap-northeast-2"),
 		AWSAccessKeyID:     getEnv("AWS_S3_ACCESS_KEY", ""),
 		AWSSecretAccessKey: getEnv("AWS_S3_SECRET_KEY", ""),
 		S3BucketName:       getEnv("AWS_S3_BUCKET", "nimda-website"),
 
-		BatchSize:    getEnvInt64("JUDGE_QUEUE_BATCH_SIZE", 10),
-		BlockTimeout: getEnvDuration("JUDGE_QUEUE_BLOCK_TIMEOUT", 5*time.Second),
+		BatchSize:    getEnvInt64("CTF_QUEUE_BATCH_SIZE", 10),
+		BlockTimeout: getEnvDuration("CTF_QUEUE_BLOCK_TIMEOUT", 5*time.Second),
 
-		ClaimInterval: getEnvDuration("JUDGE_QUEUE_CLAIM_INTERVAL", 30*time.Second),
-		MinIdleTime:   getEnvDuration("JUDGE_QUEUE_MIN_IDLE_TIME", 60*time.Second),
-		MaxDeliveries: getEnvInt64("JUDGE_QUEUE_MAX_DELIVERIES", 5),
+		ClaimInterval: getEnvDuration("CTF_QUEUE_CLAIM_INTERVAL", 30*time.Second),
+		MinIdleTime:   getEnvDuration("CTF_QUEUE_MIN_IDLE_TIME", 60*time.Second),
+		MaxDeliveries: getEnvInt64("CTF_QUEUE_MAX_DELIVERIES", 5),
 
-		ReconnectBaseDelay: getEnvDuration("JUDGE_QUEUE_RECONNECT_BASE_DELAY", 500*time.Millisecond),
-		ReconnectMaxDelay:  getEnvDuration("JUDGE_QUEUE_RECONNECT_MAX_DELAY", 30*time.Second),
+		ReconnectBaseDelay: getEnvDuration("CTF_QUEUE_RECONNECT_BASE_DELAY", 500*time.Millisecond),
+		ReconnectMaxDelay:  getEnvDuration("CTF_QUEUE_RECONNECT_MAX_DELAY", 30*time.Second),
 
 		PprofAddr: getEnv("PPROF_ADDR", ""),
 
@@ -108,7 +111,7 @@ func Load() (Config, error) {
 	}
 
 	if cfg.MaxDeliveries < 1 {
-		return Config{}, fmt.Errorf("JUDGE_QUEUE_MAX_DELIVERIES must be >= 1, got %d", cfg.MaxDeliveries)
+		return Config{}, fmt.Errorf("CTF_QUEUE_MAX_DELIVERIES must be >= 1, got %d", cfg.MaxDeliveries)
 	}
 
 	return cfg, nil
