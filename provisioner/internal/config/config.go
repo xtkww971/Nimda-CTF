@@ -1,6 +1,3 @@
-// Package config loads the worker's runtime configuration from environment
-// variables. Defaults mirror the producer side (backend-spring judge.queue.*)
-// so both sides agree on stream/group names without extra coordination.
 package config
 
 import (
@@ -25,17 +22,15 @@ type Config struct {
 	AWSSecretAccessKey string
 	S3BucketName       string
 
-	// Consumer group topology - must match the producer (nimda-cite backend).
-	// Unexported and only reachable through the getters below so every
-	// read goes through one place - see the getter docs for what each
-	// value means and why the producer must agree on it.
+	// redis stream 설정 - 웹사이트 설정과 동일하게 설정해야 함
+	// todo deadLetterStreamKey, resultStreamKey는 아직 없음
 	streamKey           string
 	consumerGroup       string
 	consumerName        string
 	deadLetterStreamKey string
 	resultStreamKey     string
 
-	// Read loop tuning
+	// redis stream에서 읽어올 데이터 설정
 	BatchSize    int64
 	BlockTimeout time.Duration
 
@@ -54,10 +49,11 @@ type Config struct {
 	// to a non-loopback address outside a developer's own machine.
 	PprofAddr string
 
-	// ExecutorSocketPath is the unix socket the Executor process (ADR-0005)
-	// listens on. Orchestrator dials this per submission to run a
-	// Start/Run/End session instead of shelling out to isolate itself.
+	// 컨테이너 생성 모듈과 통신하는 주소
 	ExecutorSocketPath string
+
+	// 컨테이너 생성 데이터를 저장할 임시 폴더 우치ㅣ
+	BuildWorkDir string
 }
 
 // getter
@@ -108,6 +104,8 @@ func Load() (Config, error) {
 		PprofAddr: getEnv("PPROF_ADDR", ""),
 
 		ExecutorSocketPath: getEnv("EXECUTOR_SOCKET_PATH", "/var/run/judge/executor.sock"),
+
+		BuildWorkDir: getEnv("CTF_BUILD_WORK_DIR", "/var/lib/ctf/build"),
 	}
 
 	if cfg.MaxDeliveries < 1 {
