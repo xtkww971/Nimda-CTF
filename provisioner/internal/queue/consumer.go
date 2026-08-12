@@ -12,19 +12,11 @@ import (
 	"nimda-judge-provisioner/internal/config"
 )
 
-// Handler processes one submission. Returning an error means "retry me
-// later" - the message is left un-ACKed and will be picked up again by the
-// reclaim loop (see Consumer.reclaimLoop). Handler implementations should be
-// idempotent: Redis Streams consumer groups give at-least-once delivery, so
-// the same submission can be handled more than once (e.g. the worker
-// crashes after judging but before XACK reaches Redis).
 type Handler interface {
-	Handle(ctx context.Context, msg *SubmissionMessage) error
+	Handle(ctx context.Context, msg *CreateRequest) (*Result, error)
 }
 
-// Consumer reads judge submissions from a Redis Stream consumer group,
-// dispatches them to a Handler, and manages the failure/retry lifecycle
-// per docs/redis-stream-queue-design.md.
+// redis와 상호작용하는 구조체
 type Consumer struct {
 	rdb     *redis.Client
 	cfg     config.Config
@@ -36,10 +28,7 @@ func NewConsumer(rdb *redis.Client, cfg config.Config, handler Handler, log *slo
 	return &Consumer{rdb: rdb, cfg: cfg, handler: handler, log: log}
 }
 
-// EnsureGroup creates the stream + consumer group if they don't exist yet.
-// It is idempotent: BUSYGROUP (group already exists) is not an error.
-// The producer (backend-spring) also does this on startup, so either side
-// coming up first is fine.
+// redis group이 생성되어 있지 않을 때 만드는 함수
 func (c *Consumer) EnsureGroup(ctx context.Context) error {
 	err := c.rdb.XGroupCreateMkStream(ctx, c.cfg.StreamKey(), c.cfg.ConsumerGroup(), "0").Err()
 	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
@@ -48,9 +37,7 @@ func (c *Consumer) EnsureGroup(ctx context.Context) error {
 	return nil
 }
 
-// Run blocks, reading new messages until ctx is cancelled. A background
-// goroutine concurrently reclaims stale pending entries (crashed/stuck
-// consumers) so a single worker crash never permanently strands work.
+// consumer가 stream 데이터 읽게 하는 함수
 func (c *Consumer) Run(ctx context.Context) {
 	go c.reclaimLoop(ctx)
 
@@ -61,6 +48,7 @@ func (c *Consumer) Run(ctx context.Context) {
 			return
 		}
 
+		// config에 정의되어 있는 값으로 데이터를 읽음
 		streams, err := c.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    c.cfg.ConsumerGroup(),
 			Consumer: c.cfg.ConsumerName(),
@@ -70,14 +58,15 @@ func (c *Consumer) Run(ctx context.Context) {
 		}).Result()
 
 		if err != nil {
+			// 아직 데이터가 도착하지 않았을 때 처리
 			if errors.Is(err, redis.Nil) {
-				// Block timeout elapsed with nothing new - expected, not an error.
 				bo.Reset()
 				continue
 			}
 			if ctx.Err() != nil {
 				return
 			}
+			// 데이터 읽기를 시도했지만 그룹이 만들어져 있지 않을 때
 			if strings.Contains(err.Error(), "NOGROUP") {
 				c.log.Warn("consumer group missing, recreating", "stream", c.cfg.StreamKey(), "group", c.cfg.ConsumerGroup())
 				if gerr := c.EnsureGroup(ctx); gerr != nil {
@@ -86,12 +75,7 @@ func (c *Consumer) Run(ctx context.Context) {
 				continue
 			}
 
-			// Transient error (connection reset, Redis restarting, network
-			// partition, ...). Back off and retry - the consumer group's
-			// last-delivered-id lives server-side in Redis, so we lose
-			// nothing by waiting: unread messages stay unread and any
-			// message we had in-flight stays in the Pending Entries List
-			// for the reclaim loop to pick up.
+			// 다음 데이터 읽기까지 주기 설정 후 대기 - queue/backoff에 로직 구현
 			wait := bo.Next()
 			c.log.Warn("XREADGROUP failed, retrying", "error", err, "wait", wait.String())
 			select {
@@ -111,12 +95,10 @@ func (c *Consumer) Run(ctx context.Context) {
 	}
 }
 
-// process handles a single delivery and decides its outcome:
-//   - malformed message (poison)   -> dead-letter immediately, ACK
-//   - handler error (transient)    -> leave un-ACKed for retry
-//   - success                      -> ACK
+// stream에서 raw data를 읽은 뒤 실행되는 함수
 func (c *Consumer) process(ctx context.Context, xmsg redis.XMessage) {
-	msg, err := ParseSubmissionMessage(xmsg.Values)
+	// raw data를 CreateRequest로 변환
+	msg, err := ParseCreateRequest(xmsg.Values)
 	if err != nil {
 		c.log.Error("poison message, moving to dead-letter stream", "id", xmsg.ID, "error", err)
 		c.deadLetter(ctx, xmsg, err, 0)
@@ -124,21 +106,40 @@ func (c *Consumer) process(ctx context.Context, xmsg redis.XMessage) {
 		return
 	}
 
-	if err := c.handler.Handle(ctx, msg); err != nil {
+	// todo 응답 메시지 처리하는 로직 미구현
+	result, err := c.handler.Handle(ctx, msg)
+	if err != nil {
 		c.log.Error("handler failed, leaving pending for retry",
-			"id", xmsg.ID, "submissionId", msg.SubmissionID, "error", err)
+			"id", xmsg.ID, "requestId", msg.RequestID, "error", err)
 		return
+	}
+
+	// A permanent failure comes back as a non-nil result with Status=FAILED,
+	// not as an error - it still needs to reach the backend, so publish it.
+	if result != nil {
+		c.publishResult(ctx, result)
 	}
 
 	c.ack(ctx, xmsg.ID)
 }
 
-// reclaimLoop periodically scans the Pending Entries List for messages that
-// have been idle (delivered but never ACKed) longer than MinIdleTime and
-// re-claims them for this consumer. This is what recovers work from a
-// worker process that crashed, was OOM-killed, or lost its network
-// connection mid-processing - Redis has no server-side timeout of its own,
-// so a claim-based sweep is required per the official Streams docs.
+// 결과를 redis stream에 저장
+func (c *Consumer) publishResult(ctx context.Context, result *Result) {
+	if err := c.rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: c.cfg.ResultStreamKey(),
+		Values: result.ToStreamValues(),
+	}).Err(); err != nil {
+		c.log.Error("failed to publish result", "requestId", result.RequestID, "error", err)
+		return
+	}
+	c.log.Info("published result",
+		"requestId", result.RequestID, "status", result.Status,
+		"host", result.Host, "port", result.Port)
+}
+
+// stream에서 데이터를 읽는 함수
+// 자료구조 특성 상 데이터 삭제를 직접 해야 하기 때문에 지금은 cursor로 계산해서 읽어옴
+// todo stream 데이터 삭제 로직 구현(여기에 말고 웹사이트에)
 func (c *Consumer) reclaimLoop(ctx context.Context) {
 	ticker := time.NewTicker(c.cfg.ClaimInterval)
 	defer ticker.Stop()
@@ -168,6 +169,7 @@ func (c *Consumer) reclaimLoop(ctx context.Context) {
 		}
 		cursor = next
 
+		// 응답 실패 시 deadLetter 처리 - config에 설정된 횟수만큼 시도
 		for _, xmsg := range claimed {
 			deliveries := c.deliveryCount(ctx, xmsg.ID)
 			if deliveries > c.cfg.MaxDeliveries {
@@ -183,9 +185,7 @@ func (c *Consumer) reclaimLoop(ctx context.Context) {
 	}
 }
 
-// deliveryCount looks up how many times this exact entry has been delivered
-// (XCLAIM/XAUTOCLAIM increment Redis's own counter), so retry limits survive
-// worker restarts instead of being tracked only in local memory.
+// stream의 data id로 전송 시도 횟수 읽어오기
 func (c *Consumer) deliveryCount(ctx context.Context, id string) int64 {
 	pending, err := c.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
 		Stream: c.cfg.StreamKey(),
@@ -195,18 +195,16 @@ func (c *Consumer) deliveryCount(ctx context.Context, id string) int64 {
 		Count:  1,
 	}).Result()
 	if err != nil || len(pending) == 0 {
-		// Entry no longer pending (e.g. raced with another claimer and got
-		// ACKed already) - treat as first delivery so we don't dead-letter
-		// on a lookup failure alone.
+		// 정상적으로 전송에 성공
 		return 1
 	}
+	// 전송 실패 시 횟수 반환
 	return pending[0].RetryCount
 }
 
-// deadLetter preserves the original fields plus failure context in a
-// separate stream so operators can inspect/replay it without it blocking
-// the main queue. See docs/redis-stream-queue-design.md section 5.
+// todo DeadLetterStream 정책 구현 - ctf 서버에서 웹 서버로 전송만 할 뿐 ctf 내부에는 redis 컨테이너 미존재(띄우지 않을 것)
 func (c *Consumer) deadLetter(ctx context.Context, xmsg redis.XMessage, cause error, deliveries int64) {
+	// 기존 메시지 사유를 추가하기 위해 len+3으로 진행
 	fields := make(map[string]interface{}, len(xmsg.Values)+3)
 	for k, v := range xmsg.Values {
 		fields[k] = v
@@ -215,6 +213,7 @@ func (c *Consumer) deadLetter(ctx context.Context, xmsg redis.XMessage, cause er
 	fields["failureReason"] = cause.Error()
 	fields["deliveryCount"] = deliveries
 
+	// todo DeadLetterStream은 웹사이트에도 미구현 따라서 통신 규격을 맞춰야 함 - ctf 서버에서는 redis 인스턴스를 넣지 않음
 	if err := c.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: c.cfg.DeadLetterStreamKey(),
 		Values: fields,
@@ -226,10 +225,6 @@ func (c *Consumer) deadLetter(ctx context.Context, xmsg redis.XMessage, cause er
 
 func (c *Consumer) ack(ctx context.Context, id string) {
 	if err := c.rdb.XAck(ctx, c.cfg.StreamKey(), c.cfg.ConsumerGroup(), id).Err(); err != nil {
-		// The message was already processed (or dead-lettered); if XACK
-		// itself fails (e.g. Redis dropped the connection at this exact
-		// moment) the entry simply stays pending and reclaimLoop will pick
-		// it up again. Handlers must be idempotent for this reason.
 		c.log.Error("XACK failed, message will be redelivered", "id", id, "error", err)
 	}
 }
