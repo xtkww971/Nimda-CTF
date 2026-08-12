@@ -2,116 +2,92 @@ package queue
 
 import "testing"
 
-// BenchmarkParseSubmissionMessage gives the optimization track a starting
-// point for measuring hot-path allocations instead of guessing - run via
-// scripts\bench.bat (or `go test -run=^$ -bench=. -benchmem ./...`).
-func BenchmarkParseSubmissionMessage(b *testing.B) {
-	values := map[string]interface{}{
-		"submissionId":     "1001",
-		"problemId":        "42",
-		"userId":           "7",
-		"language":         "JAVA",
-		"sourceCode":       "class Main {}",
-		"timeLimitSeconds": "2.5",
-		"memoryLimitMb":    "256",
-		"submittedAt":      "2026-07-17T10:00:00",
-	}
-
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		if _, err := ParseSubmissionMessage(values); err != nil {
-			b.Fatal(err)
-		}
+func validCreateFields() map[string]interface{} {
+	return map[string]interface{}{
+		"action":        "CREATE",
+		"requestId":     "req-abc",
+		"challengeCode": "web-01",
+		"userId":        "42",
+		"isolationType": "SHARED",
+		"flagType":      "STATIC",
+		"requestedAt":   "2026-08-12T10:00:00",
 	}
 }
 
-func TestParseSubmissionMessage(t *testing.T) {
-	valid := map[string]interface{}{
-		"submissionId":     "1001",
-		"problemId":        "42",
-		"userId":           "7",
-		"language":         "JAVA",
-		"sourceCode":       "class Main {}",
-		"timeLimitSeconds": "2.5",
-		"memoryLimitMb":    "256",
-		"submittedAt":      "2026-07-17T10:00:00",
-	}
-
+func TestParseCreateRequest(t *testing.T) {
 	tests := []struct {
 		name    string
 		mutate  func(map[string]interface{})
 		wantErr bool
 	}{
-		{
-			name:    "valid message parses all fields",
-			mutate:  func(m map[string]interface{}) {},
-			wantErr: false,
-		},
-		{
-			name: "missing required field is rejected",
-			mutate: func(m map[string]interface{}) {
-				delete(m, "sourceCode")
-			},
-			wantErr: true,
-		},
-		{
-			name: "empty string field is rejected",
-			mutate: func(m map[string]interface{}) {
-				m["language"] = ""
-			},
-			wantErr: true,
-		},
-		{
-			name: "non-string field type is rejected",
-			mutate: func(m map[string]interface{}) {
-				m["submissionId"] = 1001 // int, not string - Redis always delivers strings
-			},
-			wantErr: true,
-		},
-		{
-			name: "non-numeric integer field is rejected",
-			mutate: func(m map[string]interface{}) {
-				m["problemId"] = "not-a-number"
-			},
-			wantErr: true,
-		},
-		{
-			name: "non-numeric float field is rejected",
-			mutate: func(m map[string]interface{}) {
-				m["timeLimitSeconds"] = "not-a-number"
-			},
-			wantErr: true,
-		},
+		{"valid", func(map[string]interface{}) {}, false},
+		{"missing challengeCode", func(m map[string]interface{}) { delete(m, "challengeCode") }, true},
+		{"empty requestId", func(m map[string]interface{}) { m["requestId"] = "" }, true},
+		{"non-numeric userId", func(m map[string]interface{}) { m["userId"] = "abc" }, true},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			input := make(map[string]interface{}, len(valid))
-			for k, v := range valid {
-				input[k] = v
-			}
-			tt.mutate(input)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := validCreateFields()
+			tc.mutate(input)
 
-			msg, err := ParseSubmissionMessage(input)
-
-			if tt.wantErr {
+			msg, err := ParseCreateRequest(input)
+			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("expected error, got none (msg=%+v)", msg)
+					t.Fatalf("expected error, got nil")
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if msg.SubmissionID != 1001 {
-				t.Errorf("SubmissionID = %d, want 1001", msg.SubmissionID)
-			}
-			if msg.TimeLimitSeconds != 2.5 {
-				t.Errorf("TimeLimitSeconds = %v, want 2.5", msg.TimeLimitSeconds)
-			}
-			if msg.Language != "JAVA" {
-				t.Errorf("Language = %q, want JAVA", msg.Language)
+			if msg.ChallengeCode != "web-01" || msg.UserID != 42 || msg.IsolationType != "SHARED" {
+				t.Errorf("parsed fields wrong: %+v", msg)
 			}
 		})
+	}
+}
+
+func TestResultToStreamValuesReadyIncludesHostPort(t *testing.T) {
+	r := Result{
+		RequestID:     "req-abc",
+		ChallengeCode: "web-01",
+		UserID:        42,
+		Status:        StatusReady,
+		Host:          "chal.nimda.kr",
+		Port:          31337,
+		ExpiresAt:     "2026-08-12T12:00:00Z",
+	}
+	v := r.ToStreamValues()
+
+	if v["status"] != StatusReady || v["host"] != "chal.nimda.kr" || v["port"] != "31337" {
+		t.Errorf("READY result missing access fields: %+v", v)
+	}
+	if v["userId"] != "42" {
+		t.Errorf("userId = %v, want \"42\"", v["userId"])
+	}
+	if _, ok := v["message"]; ok {
+		t.Errorf("READY result should not carry a message field")
+	}
+}
+
+func TestResultToStreamValuesFailedOmitsHostPort(t *testing.T) {
+	r := Result{
+		RequestID:     "req-999",
+		ChallengeCode: "web-01",
+		UserID:        9,
+		Status:        StatusFailed,
+		Message:       "image build failed",
+	}
+	v := r.ToStreamValues()
+
+	if v["status"] != StatusFailed || v["message"] != "image build failed" {
+		t.Errorf("FAILED result missing status/message: %+v", v)
+	}
+	if _, ok := v["host"]; ok {
+		t.Errorf("FAILED result should omit host")
+	}
+	if _, ok := v["port"]; ok {
+		t.Errorf("FAILED result should omit port")
 	}
 }
