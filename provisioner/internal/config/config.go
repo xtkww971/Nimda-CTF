@@ -54,6 +54,14 @@ type Config struct {
 
 	// 컨테이너 생성 데이터를 저장할 임시 폴더 우치ㅣ
 	BuildWorkDir string
+
+	// Agent(컨테이너 생성 프로세스) 소켓 주소. 운영은 unix 소켓, 테스트는 tcp.
+	AgentNetwork string // "unix" | "tcp"
+	AgentAddr    string
+
+	// StatusAddr가 비어있지 않으면 그 주소에 HTTP 서버를 띄워, 지금 떠 있는 인스턴스와
+	// 포트를 실시간으로 조회할 수 있게 한다 (GET /instances). 예: "localhost:6070".
+	StatusAddr string
 }
 
 // getter
@@ -106,6 +114,11 @@ func Load() (Config, error) {
 		ExecutorSocketPath: getEnv("EXECUTOR_SOCKET_PATH", "/var/run/judge/executor.sock"),
 
 		BuildWorkDir: getEnv("CTF_BUILD_WORK_DIR", "/var/lib/ctf/build"),
+
+		AgentNetwork: getEnv("CTF_AGENT_NETWORK", "unix"),
+		AgentAddr:    getEnv("CTF_AGENT_ADDR", "/var/run/ctf/agent.sock"),
+
+		StatusAddr: getEnv("CTF_STATUS_ADDR", ""),
 	}
 
 	if cfg.MaxDeliveries < 1 {
