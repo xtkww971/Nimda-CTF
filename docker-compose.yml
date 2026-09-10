@@ -1,20 +1,77 @@
 services:
-  redis:
+  ctf-redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    container_name: ctf-redis
+    mem_limit: 100m
+    command: >
+      redis-server
+      --maxmemory 80mb
+      --maxmemory-policy noeviction
+      --save ""
+      --appendonly no
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ctf-internal
 
-  # Provisioner: 비특권. 큐를 소비해 문제 인스턴스 수명주기를 관리한다.
-  # 현재는 StubHandler(no-op)가 붙어 있어 메시지를 로그로만 남긴다.
-  #
-  # 특권 프로세스(Agent - 컨테이너 런타임 API 호출 담당)는 T3에서 추가한다.
-  # ADR-0007 D5에 따라 Provisioner와는 유닉스 소켓으로만 통신하며,
-  # 이미지/마운트/네트워크는 Agent 내부 화이트리스트에서만 결정한다.
+ 
+  # ⚠️ 지금 이 프로세스는 요청을 받지 못한다. 미구현
+  agent:
+    container_name: ctf-agent
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    environment:
+      - CTF_BUILD_WORK_DIR=/var/lib/ctf/build
+      # 생성된 인스턴스를 어느 주소로 안내할지. 로컬에선 호스트 루프백.
+      - CTF_INSTANCE_HOST=127.0.0.1
+      - CTF_AGENT_REDIS_ADDR=ctf-redis:6379
+      - CTF_QUEUE_AGENT_STREAM_KEY=ctf:agent:ops
+      - CTF_QUEUE_AGENT_CONSUMER_GROUP=ctf-agents
+      - CTF_QUEUE_AGENT_RESULT_STREAM_KEY=ctf:agent:results
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Provisioner가 S3에서 문제 데이터를 받아와 압축을 푸는 위치
+      - ctf-build:/var/lib/ctf/build
+    depends_on:
+      ctf-redis:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+
   provisioner:
+    container_name: ctf-provisioner
     build:
       context: .
       dockerfile: provisioner/Dockerfile
+    env_file:
+      - provisioner/.env
     environment:
-      - REDIS_ADDR=redis:6379
+      - REDIS_ADDR=nimda-redis:6379
+      - CTF_AGENT_REDIS_ADDR=ctf-redis:6379
+      - CTF_BUILD_WORK_DIR=/var/lib/ctf/build
+   
+    volumes:
+      - ctf-build:/var/lib/ctf/build
     depends_on:
-      - redis
+      ctf-redis:
+        condition: service_healthy
+    # 웹사이트와도 통신하고 내부 redis도 사용
+    networks:
+      - ctf-internal
+      - nimda-network
+
+volumes:
+  ctf-build:
+
+networks:
+  # ctf 서버 내부 컨테이너 네트워크
+  ctf-internal:
+
+  # 웹사이트 컨테이너 네트워크
+  nimda-network:
+    external: true
