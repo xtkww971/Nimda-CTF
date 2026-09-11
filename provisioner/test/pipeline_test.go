@@ -186,7 +186,7 @@ func startFakeAgent(t *testing.T, ctx context.Context, rdb *redis.Client, opsStr
 			for _, stream := range streams {
 				for _, msg := range stream.Messages {
 					lastID = msg.ID
-					req, err := protocol.ParseCreateRequest(msg.Values)
+					req, err := protocol.ParseRequestMessage(msg.Values)
 					if err != nil {
 						t.Errorf("에이전트가 받은 생성 요청을 해석하지 못함: %v (%+v)", err, msg.Values)
 						continue
@@ -196,8 +196,9 @@ func startFakeAgent(t *testing.T, ctx context.Context, rdb *redis.Client, opsStr
 					default:
 					}
 
-					result := protocol.CreateResult{
+					result := protocol.ResponseMessage{
 						UUID:       req.UUID,
+						Action:     protocol.ActionCreate,
 						Status:     protocol.StatusReady,
 						InstanceID: "fake-instance",
 						Host:       "10.9.8.7",
