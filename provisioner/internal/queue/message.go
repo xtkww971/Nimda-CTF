@@ -1,27 +1,36 @@
 package queue
 
-import (
-	"fmt"
-	"strconv"
-)
+import "strconv"
 
-type CreateRequest struct {
-	Action        string // todo 모듈을 분리해 Action에 따라 작업을 분배해야 함
-	RequestID     string
-	ChallengeCode string // S3 객체 경로
-	UserID        int64
-	IsolationType string // "SHARED" | "PER_USER" - todo IsolateionType에 따라 포트 분배 방식이 달라져야 함
-	FlagType      string // "STATIC" | "DYNAMIC"
-	RequestedAt   string
+// 웹 백엔드 ↔ 조율자 메시지.
+//
+// 예전에는 인스턴스 생성과 첨부파일 다운로드가 각자 스트림 한 쌍씩을 가졌고, 메시지
+// 구조도 따로였다. 지금은 요청 스트림 하나, 결과 스트림 하나다.
+//
+// 그래서 "무엇을 해달라"를 메시지에 실을 필요가 없어졌다. 예전 action 필드는 사실 아무도
+// 안 봤다 — 분기는 어느 스트림으로 들어왔느냐로 했기 때문이다. 이제 판단은 전부 조율자가
+// 하고, 기준은 ChallengeCategory 하나다(router.go).
+//
+// 식별자도 UUID 하나로 줄었다. 웹이 사용자마다 발급하고 UUID ↔ 사용자 매핑을 자기 쪽
+// redis에서 관리하므로, CTF 서버는 요청한 사람이 누구인지 알 필요가 없다. 남의 인스턴스에
+// 접근하는 것을 막는 것도 이 UUID를 모르면 주소를 못 만드는 것으로 처리한다.
+
+// 웹 백엔드가 보내는 요청. 종류가 하나뿐이라 이 타입 하나가 전부다.
+type Request struct {
+	UUID              string
+	ChallengeCode     string // S3 객체 경로에도 쓰인다
+	ChallengeCategory string // 무엇을 할지 정하는 유일한 기준
+	IsolationType     string // "SHARED" | "PER_USER"
+	FlagType          string // "STATIC" | "DYNAMIC"
 }
 
-// redis로 받은 데이터 raw data를 CreateRequest로 변환
-func ParseCreateRequest(values map[string]interface{}) (*CreateRequest, error) {
-	action, err := requiredString(values, "action")
-	if err != nil {
-		return nil, err
-	}
-	requestID, err := requiredString(values, "requestId")
+// redis로 받은 raw data를 Request로 변환.
+//
+// 다섯 필드 전부 필수다. 웹은 Challenge 엔티티에서 값을 채워 보내므로 빠질 이유가 없고,
+// 빠졌다면 웹 쪽 버그다. 조용히 넘어가면 isolationType 없이 인스턴스를 띄우려 드는 식으로
+// 더 나중에, 더 알아보기 어려운 모양으로 터진다.
+func ParseRequest(values map[string]interface{}) (*Request, error) {
+	uuid, err := requiredString(values, "uuid")
 	if err != nil {
 		return nil, err
 	}
@@ -29,7 +38,7 @@ func ParseCreateRequest(values map[string]interface{}) (*CreateRequest, error) {
 	if err != nil {
 		return nil, err
 	}
-	userID, err := requiredInt64(values, "userId")
+	challengeCategory, err := requiredString(values, "challengeCategory")
 	if err != nil {
 		return nil, err
 	}
@@ -41,47 +50,47 @@ func ParseCreateRequest(values map[string]interface{}) (*CreateRequest, error) {
 	if err != nil {
 		return nil, err
 	}
-	requestedAt, err := requiredString(values, "requestedAt")
-	if err != nil {
-		return nil, err
-	}
 
-	return &CreateRequest{
-		Action:        action,
-		RequestID:     requestID,
-		ChallengeCode: challengeCode,
-		UserID:        userID,
-		IsolationType: isolationType,
-		FlagType:      flagType,
-		RequestedAt:   requestedAt,
+	return &Request{
+		UUID:              uuid,
+		ChallengeCode:     challengeCode,
+		ChallengeCategory: challengeCategory,
+		IsolationType:     isolationType,
+		FlagType:          flagType,
 	}, nil
 }
 
-// todo 결과 반환 로직 미구현
+// 처리 결과 상태.
 const (
 	StatusReady  = "READY"
 	StatusFailed = "FAILED"
 )
 
-// todo 결과 반환 로직 미구현 일단 웹사이트와 데이터 구조만 맞춰놓은 상태
+// 조율자가 돌려주는 결과. 인스턴스든 다운로드든 이 타입 하나로 나간다.
+//
+// Host/Port는 인스턴스일 때, DownloadURL은 첨부파일일 때만 찬다. 받는 쪽은 어느 쪽이
+// 들어있는지로 구분한다 — 요청에 action이 없으니 결과에도 없다.
 type Result struct {
-	RequestID     string
-	ChallengeCode string
-	UserID        int64
-	Status        string // StatusReady | StatusFailed
-	Host          string // 실패 시 empty
-	Port          int    // 실패 시 0
-	ExpiresAt     string // todo 연결 종료 시간 설정 구현해야 함
-	Message       string // 실패 사유
+	UUID        string
+	Status      string // StatusReady | StatusFailed
+	Message     string // 실패 사유
+	Host        string // 인스턴스 READY일 때
+	Port        int    // 인스턴스 READY일 때
+	ExpiresAt   string // RFC3339. 인스턴스는 PER_USER일 때, 다운로드는 링크 만료 시각
+	DownloadURL string // 첨부파일 READY일 때
 }
 
-// 결과를 redis stream에 넣는 함수
+// 결과를 redis stream에 넣는 함수.
+//
+// 빈 값은 키째로 뺀다. port가 "0"으로 실리면 받는 쪽이 0번 포트로 읽고, downloadUrl이
+// 빈 문자열로 실리면 링크가 있는 줄 안다. "키가 없다 = 값이 없다"로 맞춘다.
 func (r Result) ToStreamValues() map[string]interface{} {
 	values := map[string]interface{}{
-		"requestId":     r.RequestID,
-		"challengeCode": r.ChallengeCode,
-		"userId":        strconv.FormatInt(r.UserID, 10),
-		"status":        r.Status,
+		"uuid":   r.UUID,
+		"status": r.Status,
+	}
+	if r.Message != "" {
+		values["message"] = r.Message
 	}
 	if r.Host != "" {
 		values["host"] = r.Host
@@ -92,36 +101,8 @@ func (r Result) ToStreamValues() map[string]interface{} {
 	if r.ExpiresAt != "" {
 		values["expiresAt"] = r.ExpiresAt
 	}
-	if r.Message != "" {
-		values["message"] = r.Message
+	if r.DownloadURL != "" {
+		values["downloadUrl"] = r.DownloadURL
 	}
 	return values
-}
-
-// helper 함수들
-func requiredString(values map[string]interface{}, key string) (string, error) {
-	raw, ok := values[key]
-	if !ok {
-		return "", fmt.Errorf("field %q is missing", key)
-	}
-	s, ok := raw.(string)
-	if !ok {
-		return "", fmt.Errorf("field %q has unexpected type %T", key, raw)
-	}
-	if s == "" {
-		return "", fmt.Errorf("field %q is empty", key)
-	}
-	return s, nil
-}
-
-func requiredInt64(values map[string]interface{}, key string) (int64, error) {
-	s, err := requiredString(values, key)
-	if err != nil {
-		return 0, err
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("field %q is not a valid integer: %w", key, err)
-	}
-	return n, nil
 }
