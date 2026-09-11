@@ -13,13 +13,12 @@ import (
 
 // 에이전트에게 작업을 넘기는 쪽. 핸들러는 이 인터페이스만 알면 된다.
 type Dispatcher interface {
-	// 인스턴스 생성을 에이전트에게 맡긴다. 반환된 에러는 "스트림에 넣지도 못했다"는 뜻이다.
+	// 요청을 에이전트에게 맡긴다. 반환된 에러는 "스트림에 넣지도 못했다"는 뜻이다.
 	// 빌드/실행 실패는 여기가 아니라 결과 스트림에 Status=FAILED로 온다.
-	// 인스턴스 생성 요청
-	DispatchCreate(ctx context.Context, req protocol.CreateRequest) error
-
-	// 인스턴스 파괴 요청
-	DispatchDestroy(ctx context.Context, req protocol.DestroyRequest) error
+	//
+	// 생성이냐 삭제냐는 req.Action이 말한다. 요청 종류마다 메서드를 나누지 않는 이유는
+	// 넣는 절차가 똑같기 때문이다 — 달라지는 건 메시지 내용뿐이다.
+	Dispatch(ctx context.Context, req protocol.RequestMessage) error
 }
 
 // Redis Stream으로 구현한 Dispatcher.
@@ -35,12 +34,8 @@ func NewStreamDispatcher(rdb *redis.Client, stream string, log *slog.Logger) *St
 
 var _ Dispatcher = (*StreamDispatcher)(nil)
 
-func (d *StreamDispatcher) DispatchCreate(ctx context.Context, req protocol.CreateRequest) error {
-	return d.publish(ctx, req.ToStreamValues(), req.UUID, protocol.ActionCreate)
-}
-
-func (d *StreamDispatcher) DispatchDestroy(ctx context.Context, req protocol.DestroyRequest) error {
-	return d.publish(ctx, req.ToStreamValues(), req.UUID, protocol.ActionDestroy)
+func (d *StreamDispatcher) Dispatch(ctx context.Context, req protocol.RequestMessage) error {
+	return d.publish(ctx, req.ToStreamValues(), req.UUID, req.Action)
 }
 
 // 스트림에 남겨둘 엔트리 수의 대략적 상한.
