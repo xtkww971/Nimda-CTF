@@ -17,7 +17,7 @@ import (
 // 웹이 보는 결과가 그 둘을 요구했기 때문인데, 지금은 웹도 UUID 하나로 자기 요청을 찾는다.
 // 그래서 봉투가 사라지고 에이전트의 결과를 거의 그대로 옮기면 된다.
 type AgentResultHandler interface {
-	Handle(ctx context.Context, res *protocol.CreateResult) (*Result, error)
+	Handle(ctx context.Context, res *protocol.ResponseMessage) (*Result, error)
 }
 
 // 에이전트 결과(ctf:agent:results) 컨슈머.
@@ -33,7 +33,7 @@ func NewAgentResultConsumer(agentRdb, webRdb *redis.Client, cfg config.Config, h
 		deadLetter:   cfg.AgentDeadLetterStreamKey(),
 	}
 	work := func(ctx context.Context, values map[string]interface{}) (map[string]interface{}, string, error) {
-		res, err := protocol.ParseCreateResult(values)
+		res, err := protocol.ParseResponseMessage(values)
 		if err != nil {
 			return nil, "", err
 		}
@@ -42,7 +42,7 @@ func NewAgentResultConsumer(agentRdb, webRdb *redis.Client, cfg config.Config, h
 			slog.String("uuid", res.UUID),
 			slog.String("stream", spec.stream),
 		)
-		reqLog.InfoContext(ctx, "received agent result", "status", res.Status)
+		reqLog.InfoContext(ctx, "received agent result", "action", res.Action, "status", res.Status)
 
 		result, err := handler.Handle(ctx, res)
 		if err != nil || result == nil {
