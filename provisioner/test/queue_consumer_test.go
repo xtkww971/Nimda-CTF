@@ -10,9 +10,28 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"nimda-judge-provisioner/internal/config"
-	"nimda-judge-provisioner/internal/handler"
 	"nimda-judge-provisioner/internal/queue"
 )
+
+// 컨슈머 배선만 보는 테스트라 진짜 핸들러가 필요 없다. 받은 요청을 READY 결과로 되돌린다.
+//
+// 예전에는 handler.StubHandler를 썼다. 메시지 구조가 통합되면서 S3 없이 굴러가는 폴백이
+// 의미를 잃어 지웠고(조율자는 이제 S3 없이는 아무 요청도 처리할 수 없다), 여기서만
+// 필요한 가짜라 테스트 쪽에 둔다.
+type echoHandler struct{}
+
+func (echoHandler) Handle(_ context.Context, msg *queue.Request) (*queue.Result, error) {
+	res := &queue.Result{
+		UUID:   msg.UUID,
+		Status: queue.StatusReady,
+		Host:   "chal.nimda.kr",
+		Port:   32768,
+	}
+	if msg.IsolationType == "PER_USER" {
+		res.ExpiresAt = "2026-09-10T12:00:00Z"
+	}
+	return res, nil
+}
 
 // redisAddr is the docker test Redis. Start it with:
 //
@@ -21,7 +40,7 @@ const redisAddr = "localhost:6380"
 
 // TestReceiveRequestAndPublishResult drives the whole receive -> respond path
 // against a real Redis: publish a create request, let the consumer pick it up
-// with the StubHandler, and assert the result lands on the result stream.
+// with a stub handler, and assert the result lands on the result stream.
 func TestReceiveRequestAndPublishResult(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 	pingCtx, cancelPing := context.WithTimeout(context.Background(), time.Second)
@@ -32,8 +51,8 @@ func TestReceiveRequestAndPublishResult(t *testing.T) {
 
 	// Unique stream/group names so parallel runs and leftovers never collide.
 	suffix := time.Now().UnixNano()
-	reqStream := "test:ctf:instance:ops:" + itoa(suffix)
-	resultStream := "test:ctf:instance:results:" + itoa(suffix)
+	reqStream := "test:ctf:request:ops:" + itoa(suffix)
+	resultStream := "test:ctf:request:results:" + itoa(suffix)
 	group := "test-provisioners-" + itoa(suffix)
 
 	t.Setenv("REDIS_ADDR", redisAddr)
@@ -55,7 +74,7 @@ func TestReceiveRequestAndPublishResult(t *testing.T) {
 	})
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	consumer := queue.NewConsumer(rdb, cfg, handler.NewStubHandler(logger), logger)
+	consumer := queue.NewConsumer(rdb, cfg, echoHandler{}, logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -70,13 +89,11 @@ func TestReceiveRequestAndPublishResult(t *testing.T) {
 	if err := rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: reqStream,
 		Values: map[string]interface{}{
-			"action":        "CREATE",
-			"requestId":     "req-int-1",
-			"challengeCode": "web-01",
-			"userId":        "42",
-			"isolationType": "PER_USER",
-			"flagType":      "DYNAMIC",
-			"requestedAt":   "2026-08-12T10:00:00",
+			"uuid":              "uuid-int-1",
+			"challengeCode":     "web-01",
+			"challengeCategory": "WEB",
+			"isolationType":     "PER_USER",
+			"flagType":          "DYNAMIC",
 		},
 	}).Err(); err != nil {
 		t.Fatalf("publish request: %v", err)
@@ -85,14 +102,15 @@ func TestReceiveRequestAndPublishResult(t *testing.T) {
 	// Poll the result stream until the consumer publishes (or we time out).
 	values := waitForResult(t, rdb, resultStream, 5*time.Second)
 
-	if values["requestId"] != "req-int-1" {
-		t.Errorf("requestId = %v, want req-int-1", values["requestId"])
+	if values["uuid"] != "uuid-int-1" {
+		t.Errorf("uuid = %v, want uuid-int-1", values["uuid"])
 	}
 	if values["status"] != queue.StatusReady {
 		t.Errorf("status = %v, want READY", values["status"])
 	}
-	if values["challengeCode"] != "web-01" || values["userId"] != "42" {
-		t.Errorf("result did not echo identity: %+v", values)
+	// 결과에 남는 식별자는 uuid 하나다. 사용자·문제를 되짚는 건 웹 쪽 몫이다.
+	if values["userId"] != nil || values["challengeCode"] != nil {
+		t.Errorf("결과에 userId/challengeCode가 실림: %+v", values)
 	}
 	if values["host"] == "" || values["port"] == nil {
 		t.Errorf("READY result missing host/port: %+v", values)
@@ -109,6 +127,32 @@ func TestReceiveRequestAndPublishResult(t *testing.T) {
 	if pending.Count != 0 {
 		t.Errorf("request should be ACKed, but %d entries still pending", pending.Count)
 	}
+
+	// 그리고 스트림에서도 지워져 있어야 한다.
+	//
+	// XACK만으로는 엔트리가 남는다. Redis Stream에는 자동 만료가 없어서, 안 지우면
+	// 요청을 받는 만큼 무한정 자란다 — pending은 0인데 XLEN만 계속 늘어나는 모양이 된다.
+	assertStreamDrained(t, rdb, reqStream, 5*time.Second)
+}
+
+// 처리가 끝난 엔트리가 스트림에서 사라질 때까지 기다린다.
+// ACK과 XDEL 사이에 아주 짧은 틈이 있어서 바로 보면 아직 남아 있을 수 있다.
+func assertStreamDrained(t *testing.T, rdb *redis.Client, stream string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last int64
+	for time.Now().Before(deadline) {
+		n, err := rdb.XLen(context.Background(), stream).Result()
+		if err != nil {
+			t.Fatalf("XLEN: %v", err)
+		}
+		if n == 0 {
+			return
+		}
+		last = n
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("처리가 끝났는데 %s에 엔트리가 %d개 남아 있습니다 (XACK만 하고 XDEL을 안 한 상태)", stream, last)
 }
 
 // TestPoisonRequestGoesToDeadLetter verifies a malformed request is not
@@ -122,7 +166,7 @@ func TestPoisonRequestGoesToDeadLetter(t *testing.T) {
 	}
 
 	suffix := time.Now().UnixNano()
-	reqStream := "test:ctf:instance:ops:" + itoa(suffix)
+	reqStream := "test:ctf:request:ops:" + itoa(suffix)
 	deadLetter := reqStream + ":dead-letter"
 	group := "test-provisioners-" + itoa(suffix)
 
@@ -144,7 +188,7 @@ func TestPoisonRequestGoesToDeadLetter(t *testing.T) {
 	})
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	consumer := queue.NewConsumer(rdb, cfg, handler.NewStubHandler(logger), logger)
+	consumer := queue.NewConsumer(rdb, cfg, echoHandler{}, logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -153,21 +197,24 @@ func TestPoisonRequestGoesToDeadLetter(t *testing.T) {
 	}
 	go consumer.Run(ctx)
 
-	// Missing challengeCode -> unparseable -> poison.
+	// challengeCategory가 없다 -> 무엇을 해야 할지 알 수 없다 -> poison.
 	if err := rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: reqStream,
-		Values: map[string]interface{}{"action": "CREATE", "requestId": "req-bad"},
+		Values: map[string]interface{}{"uuid": "uuid-bad", "challengeCode": "web-01"},
 	}).Err(); err != nil {
 		t.Fatalf("publish poison: %v", err)
 	}
 
 	values := waitForResult(t, rdb, deadLetter, 5*time.Second)
-	if values["requestId"] != "req-bad" {
+	if values["uuid"] != "uuid-bad" {
 		t.Errorf("dead-letter entry should preserve original fields: %+v", values)
 	}
 	if values["failureReason"] == nil {
 		t.Errorf("dead-letter entry should record a failureReason: %+v", values)
 	}
+
+	// 독성 메시지도 원본 스트림에서는 지워져야 한다. 내용은 데드레터에 남아 있다.
+	assertStreamDrained(t, rdb, reqStream, 5*time.Second)
 }
 
 func waitForResult(t *testing.T, rdb *redis.Client, stream string, timeout time.Duration) map[string]interface{} {

@@ -8,7 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"nimda-judge-provisioner/internal/awsUtil"
+	"nimda-judge-provisioner/internal/archive"
+	"nimda-judge-provisioner/internal/aws"
 	"nimda-judge-provisioner/internal/config"
 )
 
@@ -38,7 +39,7 @@ func TestDownloadAndUnzipFromS3(t *testing.T) {
 	const code = "web-basic-01"
 	objectKey := "challenges/" + code + "/" + code + ".zip"
 
-	store, err := awsUtil.NewS3Storage(ctx, cfg)
+	store, err := aws.NewS3Storage(ctx, cfg)
 	if err != nil {
 		t.Fatalf("S3 클라이언트 생성 실패: %v", err)
 	}
@@ -57,7 +58,7 @@ func TestDownloadAndUnzipFromS3(t *testing.T) {
 	t.Logf("다운로드 완료: %s (%d bytes)", objectKey, len(zipData))
 
 	// 2) 압축 해제.
-	dir, err := awsUtil.UnzipBytesToDir(zipData, &cfg)
+	dir, err := archive.UnzipBytesToDir(zipData, &cfg)
 	if err != nil {
 		t.Fatalf("압축 해제 실패: %v", err)
 	}

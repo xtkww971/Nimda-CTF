@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"nimda-judge-provisioner/internal/awsUtil"
+	"nimda-judge-provisioner/internal/aws"
 	"nimda-judge-provisioner/internal/config"
 )
 
@@ -29,7 +29,7 @@ func TestGetFile(t *testing.T) {
 		t.Fatalf("버킷 설정 로드 실패")
 	}
 
-	store, err := awsUtil.NewS3Storage(ctx, cfg)
+	store, err := aws.NewS3Storage(ctx, cfg)
 	if err != nil {
 		t.Fatalf("버킷 생성에 실패했습니다. %v", err)
 	}
