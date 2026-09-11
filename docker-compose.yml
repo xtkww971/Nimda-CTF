@@ -19,7 +19,8 @@ services:
       - ctf-internal
 
  
-  # ⚠️ 지금 이 프로세스는 요청을 받지 못한다. 미구현
+  # 특권 프로세스. ctf:agent:ops를 읽어 문제 컨테이너를 빌드/실행하고
+  # ctf:agent:results로 결과를 돌려준다. uuid -> 컨테이너 기록도 같은 redis에 남긴다.
   agent:
     container_name: ctf-agent
     build:
