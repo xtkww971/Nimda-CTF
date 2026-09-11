@@ -92,8 +92,9 @@ func (h *Handler) Handle(ctx context.Context, msg *CreateInstanceMessage) (*queu
 	}
 
 	// 3) 에이전트에게 넘긴다.
-	err = h.agent.DispatchCreate(ctx, protocol.CreateRequest{
+	err = h.agent.Dispatch(ctx, protocol.RequestMessage{
 		UUID:             msg.UUID,
+		Action:           protocol.ActionCreate,
 		ChallengeCode:    msg.ChallengeCode,
 		IsolationType:    msg.IsolationType,
 		FlagType:         msg.FlagType,
@@ -108,9 +109,9 @@ func (h *Handler) Handle(ctx context.Context, msg *CreateInstanceMessage) (*queu
 		return nil, err
 	}
 
-	// todo 풀어둔 폴더는 누가 지우나. 소켓 시절엔 Create가 반환될 때 defer로 지웠지만
-	//  이제 에이전트가 언제 빌드를 끝내는지 조율자가 모른다. 에이전트가 빌드 후 지우거나,
-	//  결과를 받은 뒤 조율자가 지우거나 둘 중 하나로 정해야 한다.
+	// 풀어둔 폴더는 여기서 지우지 않는다. 빌드가 끝나는 시점을 아는 건 에이전트뿐이고,
+	// 조율자는 스트림에 넣고 손을 떼기 때문에 언제 지워도 되는지 모른다. 에이전트가
+	// 빌드 후 치운다(agent/internal/agentqueue의 cleanupBuildDir).
 
 	// 결과는 지금 없다. 에이전트가 결과 스트림에 넣으면 AgentResultConsumer가 발행한다.
 	return nil, nil
@@ -139,7 +140,7 @@ func NewAgentResultMapper(log *slog.Logger) *AgentResultMapper {
 
 var _ queue.AgentResultHandler = (*AgentResultMapper)(nil)
 
-func (m *AgentResultMapper) Handle(ctx context.Context, res *protocol.CreateResult) (*queue.Result, error) {
+func (m *AgentResultMapper) Handle(ctx context.Context, res *protocol.ResponseMessage) (*queue.Result, error) {
 	// todo 여기서 인스턴스 대장(어느 UUID가 어느 포트인지)을 갱신할 자리.
 	//  ADR-0011의 서브도메인 프록시가 이 정보를 봐야 한다.
 	return &queue.Result{
