@@ -5,76 +5,86 @@ import (
 	"strconv"
 )
 
-// Redis Stream 위의 메시지 형식 (조율자 ↔ 에이전트).
-// 스트림에 실리는 action 값. 웹 백엔드 → 조율자 큐가 쓰는 관례를 그대로 따른다.
-const (
-	ActionCreate  = "CREATE"
-	ActionDestroy = "DESTROY"
-)
+// Redis Stream 위의 메시지 변환 (조율자 ↔ 에이전트).
+// 필수/선택이 Action에 따라 갈린다. CREATE는 빌드에 필요한 필드가 다 있어야 하고,
+// DESTROY는 UUID만 있으면 된다. 그래서 파싱은 먼저 action을 읽고 그에 맞춰 검사한다.
 
-// ── 조율자 → 에이전트 (생성 요청) ──────────────────────────────────────────
+// ── 조율자 → 에이전트 ──────────────────────────────────────────────────────
 
-func (r CreateRequest) ToStreamValues() map[string]interface{} {
+func (r RequestMessage) ToStreamValues() map[string]interface{} {
 	values := map[string]interface{}{
-		"action":           ActionCreate,
-		"requestId":        r.RequestID,
-		"challengeCode":    r.ChallengeCode,
-		"userId":           strconv.FormatInt(r.UserID, 10),
-		"isolationType":    r.IsolationType,
-		"flagType":         r.FlagType,
-		"buildContextPath": r.BuildContextPath,
+		"uuid":   r.UUID,
+		"action": r.Action,
+	}
+	// 빈 값은 키째로 뺀다. DESTROY에 빈 challengeCode가 실려 있으면 받는 쪽이
+	// "코드가 빈 문제"로 읽는다.
+	if r.ChallengeCode != "" {
+		values["challengeCode"] = r.ChallengeCode
+	}
+	if r.IsolationType != "" {
+		values["isolationType"] = r.IsolationType
+	}
+	if r.FlagType != "" {
+		values["flagType"] = r.FlagType
 	}
 	// DYNAMIC일 때만 실린다. STATIC 문제에 빈 FLAG를 주입하지 않도록 있을 때만 넣는다.
 	if r.Flag != "" {
 		values["flag"] = r.Flag
 	}
+	if r.BuildContextPath != "" {
+		values["buildContextPath"] = r.BuildContextPath
+	}
 	return values
 }
 
-func ParseCreateRequest(values map[string]interface{}) (*CreateRequest, error) {
-	requestID, err := requiredString(values, "requestId")
+func ParseRequestMessage(values map[string]interface{}) (*RequestMessage, error) {
+	uuid, err := requiredString(values, "uuid")
 	if err != nil {
 		return nil, err
 	}
-	challengeCode, err := requiredString(values, "challengeCode")
-	if err != nil {
-		return nil, err
-	}
-	userID, err := requiredInt64(values, "userId")
-	if err != nil {
-		return nil, err
-	}
-	isolationType, err := requiredString(values, "isolationType")
-	if err != nil {
-		return nil, err
-	}
-	flagType, err := requiredString(values, "flagType")
+	action, err := requiredString(values, "action")
 	if err != nil {
 		return nil, err
 	}
 
-	buildContextPath, err := requiredString(values, "buildContextPath")
-	if err != nil {
-		return nil, err
-	}
-
-	return &CreateRequest{
-		RequestID:        requestID,
-		ChallengeCode:    challengeCode,
-		UserID:           userID,
-		IsolationType:    isolationType,
-		FlagType:         flagType,
+	req := &RequestMessage{
+		UUID:             uuid,
+		Action:           action,
+		ChallengeCode:    optionalString(values, "challengeCode"),
+		IsolationType:    optionalString(values, "isolationType"),
+		FlagType:         optionalString(values, "flagType"),
 		Flag:             optionalString(values, "flag"),
-		BuildContextPath: buildContextPath,
-	}, nil
+		BuildContextPath: optionalString(values, "buildContextPath"),
+	}
+
+	switch action {
+	case ActionCreate:
+		for _, f := range []struct{ name, value string }{
+			{"challengeCode", req.ChallengeCode},
+			{"isolationType", req.IsolationType},
+			{"flagType", req.FlagType},
+			{"buildContextPath", req.BuildContextPath},
+		} {
+			if f.value == "" {
+				return nil, fmt.Errorf("field %q is required for action %q", f.name, action)
+			}
+		}
+	case ActionDestroy:
+		// 어느 컨테이너인지는 에이전트가 uuid로 찾는다. 더 요구할 것이 없다.
+	default:
+		return nil, fmt.Errorf("field %q has unknown value %q", "action", action)
+	}
+
+	return req, nil
 }
 
-// ── 에이전트 → 조율자 (생성 결과) ──────────────────────────────────────────
+// ── 에이전트 → 조율자 ──────────────────────────────────────────────────────
 
-func (r CreateResult) ToStreamValues() map[string]interface{} {
+func (r ResponseMessage) ToStreamValues() map[string]interface{} {
 	values := map[string]interface{}{
-		"requestId": r.RequestID,
-		"status":    r.Status,
+		"uuid":   r.UUID,
+		"action": r.Action,
+		"status": r.Status,
 	}
 	// 실패면 아래는 전부 비어 있다. 빈 값을 실어 보내면 받는 쪽이 "0번 포트"처럼 읽을 수
 	// 있으므로, 있을 때만 싣는다.
@@ -96,8 +106,12 @@ func (r CreateResult) ToStreamValues() map[string]interface{} {
 	return values
 }
 
-func ParseCreateResult(values map[string]interface{}) (*CreateResult, error) {
-	requestID, err := requiredString(values, "requestId")
+func ParseResponseMessage(values map[string]interface{}) (*ResponseMessage, error) {
+	uuid, err := requiredString(values, "uuid")
+	if err != nil {
+		return nil, err
+	}
+	action, err := requiredString(values, "action")
 	if err != nil {
 		return nil, err
 	}
@@ -105,12 +119,15 @@ func ParseCreateResult(values map[string]interface{}) (*CreateResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	if status != StatusReady && status != StatusFailed {
+	switch status {
+	case StatusReady, StatusFailed, StatusDestroyed, StatusNotFound:
+	default:
 		return nil, fmt.Errorf("field %q has unknown value %q", "status", status)
 	}
 
-	res := &CreateResult{
-		RequestID:  requestID,
+	res := &ResponseMessage{
+		UUID:       uuid,
+		Action:     action,
 		Status:     status,
 		InstanceID: optionalString(values, "instanceId"),
 		Host:       optionalString(values, "host"),
@@ -129,85 +146,7 @@ func ParseCreateResult(values map[string]interface{}) (*CreateResult, error) {
 	return res, nil
 }
 
-// ── 조율자 → 에이전트 (삭제 요청) ──────────────────────────────────────────
-
-func (r DestroyRequest) ToStreamValues() map[string]interface{} {
-	values := map[string]interface{}{
-		"action":     ActionDestroy,
-		"requestId":  r.RequestID,
-		"instanceId": r.InstanceID,
-	}
-	// 삭제 자체엔 필요 없지만 로그로 남기려고 싣는다(구 DestroyRequest 주석 참고).
-	if r.ChallengeCode != "" {
-		values["challengeCode"] = r.ChallengeCode
-	}
-	if r.UserID != 0 {
-		values["userId"] = strconv.FormatInt(r.UserID, 10)
-	}
-	return values
-}
-
-func ParseDestroyRequest(values map[string]interface{}) (*DestroyRequest, error) {
-	requestID, err := requiredString(values, "requestId")
-	if err != nil {
-		return nil, err
-	}
-	instanceID, err := requiredString(values, "instanceId")
-	if err != nil {
-		return nil, err
-	}
-	req := &DestroyRequest{
-		RequestID:     requestID,
-		InstanceID:    instanceID,
-		ChallengeCode: optionalString(values, "challengeCode"),
-	}
-	if raw := optionalString(values, "userId"); raw != "" {
-		userID, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("field %q is not a valid integer: %w", "userId", err)
-		}
-		req.UserID = userID
-	}
-	return req, nil
-}
-
-// ── 에이전트 → 조율자 (삭제 결과) ──────────────────────────────────────────
-
-func (r DestroyResult) ToStreamValues() map[string]interface{} {
-	values := map[string]interface{}{
-		"requestId": r.RequestID,
-		"status":    r.Status,
-	}
-	if r.Message != "" {
-		values["message"] = r.Message
-	}
-	return values
-}
-
-func ParseDestroyResult(values map[string]interface{}) (*DestroyResult, error) {
-	requestID, err := requiredString(values, "requestId")
-	if err != nil {
-		return nil, err
-	}
-	status, err := requiredString(values, "status")
-	if err != nil {
-		return nil, err
-	}
-	switch status {
-	case DestroyDone, DestroyNotFound, DestroyFailed:
-	default:
-		return nil, fmt.Errorf("field %q has unknown value %q", "status", status)
-	}
-	return &DestroyResult{
-		RequestID: requestID,
-		Status:    status,
-		Message:   optionalString(values, "message"),
-	}, nil
-}
-
 // ── 필드 헬퍼 ─────────────────────────────────────────────────────────────
-// provisioner의 queue 패키지에 같은 모양의 헬퍼가 있지만 그쪽은 비공개다. 여기는 조율자와
-// 에이전트가 함께 쓰는 모듈이라 따로 둔다.
 
 func requiredString(values map[string]interface{}, key string) (string, error) {
 	raw, ok := values[key]
@@ -224,18 +163,6 @@ func requiredString(values map[string]interface{}, key string) (string, error) {
 	return s, nil
 }
 
-func requiredInt64(values map[string]interface{}, key string) (int64, error) {
-	s, err := requiredString(values, key)
-	if err != nil {
-		return 0, err
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("field %q is not a valid integer: %w", key, err)
-	}
-	return n, nil
-}
-
 // 없거나 문자열이 아니면 빈 문자열. 선택 필드용이라 에러로 보지 않는다.
 func optionalString(values map[string]interface{}, key string) string {
 	raw, ok := values[key]
@@ -247,39 +174,4 @@ func optionalString(values map[string]interface{}, key string) string {
 		return ""
 	}
 	return s
-}
-
-// ── 에이전트 → 조율자 (결과 봉투) ──────────────────────────────────────────
-
-// 웹 결과 스트림(queue.Result)은 challengeCode/userId를 요구하는데 CreateResult에는 없다.
-// 소켓 시절엔 조율자가 요청을 손에 쥔 채 응답을 기다렸으니 알 수 있었지만, 스트림은
-// 발행하고 끝이라 나중에 결과만 받아서는 "어느 문제의 누구였는지"를 복원할 수 없다.
-// 그래서 에이전트가 그 둘을 되돌려준다.
-type AgentResult struct {
-	CreateResult
-	ChallengeCode string
-	UserID        int64
-}
-
-func (r AgentResult) ToStreamValues() map[string]interface{} {
-	values := r.CreateResult.ToStreamValues()
-	values["challengeCode"] = r.ChallengeCode
-	values["userId"] = strconv.FormatInt(r.UserID, 10)
-	return values
-}
-
-func ParseAgentResult(values map[string]interface{}) (*AgentResult, error) {
-	base, err := ParseCreateResult(values)
-	if err != nil {
-		return nil, err
-	}
-	challengeCode, err := requiredString(values, "challengeCode")
-	if err != nil {
-		return nil, err
-	}
-	userID, err := requiredInt64(values, "userId")
-	if err != nil {
-		return nil, err
-	}
-	return &AgentResult{CreateResult: *base, ChallengeCode: challengeCode, UserID: userID}, nil
 }
