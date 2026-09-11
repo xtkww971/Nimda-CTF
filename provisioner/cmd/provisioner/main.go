@@ -1,15 +1,10 @@
-// Command provisioner is the Nimda CTF server's queue consumer process: it
-// reads instance operations from the Redis Stream that backend-spring
-// produces to and dispatches them to a queue.Handler. See
-// docs/redis-stream-queue-design.md for the reasoning behind the queue
-// design and failure handling.
 package main
 
 import (
 	"context"
 	"log/slog"
 	"net/http"
-	_ "net/http/pprof" // registers /debug/pprof/* on http.DefaultServeMux; only served if cfg.PprofAddr is set
+	_ "net/http/pprof" // /debug/pprof/* 를 등록만 해둠. 실제로는 cfg.PprofAddr가 설정됐을 때만 서비스됨
 	"os"
 	"os/signal"
 	"strings"
@@ -18,18 +13,19 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"nimda-judge-provisioner/internal/agentclient"
+	"nimda-judge-provisioner/internal/aws"
 	"nimda-judge-provisioner/internal/config"
 	"nimda-judge-provisioner/internal/handler"
 	"nimda-judge-provisioner/internal/queue"
 )
 
 func main() {
-	// LOG_LEVEL is read directly (not via config.Load) so the logger exists
-	// before configuration is validated and can report a bad config.
+	// logger 생성
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: parseLogLevel(os.Getenv("LOG_LEVEL")),
 	}))
-
+	// 환경 설정 불러오기
 	cfg, err := config.Load()
 	if err != nil {
 		logger.Error("invalid configuration", "error", err)
@@ -38,6 +34,7 @@ func main() {
 	logger.Info("starting provisioner",
 		"consumerName", cfg.ConsumerName(),
 		"streamKey", cfg.StreamKey(),
+		"resultStreamKey", cfg.ResultStreamKey(),
 		"consumerGroup", cfg.ConsumerGroup(),
 	)
 
@@ -50,6 +47,7 @@ func main() {
 		}()
 	}
 
+	// 웹사이트 통신 파이프라인
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.RedisAddr,
 		Password: cfg.RedisPassword,
@@ -57,28 +55,72 @@ func main() {
 	})
 	defer rdb.Close()
 
+	// agent 통신 파이프라인 설정 값 주입
+	agentRdb := rdb
+	if cfg.AgentRedisAddr != "" {
+		addr, password, db := cfg.AgentRedis()
+		agentRdb = redis.NewClient(&redis.Options{Addr: addr, Password: password, DB: db})
+		defer agentRdb.Close()
+	}
+
+	// 종료 시 사용할 stop 함수 받아오기 및 최상위 ctx 설정
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// redis 연결 대기
 	if err := waitForRedis(ctx, rdb, logger); err != nil {
 		logger.Error("giving up waiting for redis", "error", err)
 		os.Exit(1)
 	}
 
-	consumer := queue.NewConsumer(rdb, cfg, handler.NewStubHandler(logger), logger)
+	if agentRdb != rdb {
+		if err := waitForRedis(ctx, agentRdb, logger); err != nil {
+			logger.Error("giving up waiting for agent redis", "addr", cfg.AgentRedisAddr, "error", err)
+			os.Exit(1)
+		}
+	}
+
+	// s3 연결
+	s3, err := aws.NewS3Storage(ctx, cfg)
+	if err != nil {
+		logger.Error("S3 연결 실패, Provisioner를 시작할 수 없습니다", "error", err)
+		os.Exit(1)
+	}
+
+	// agent 통신 연결
+	dispatcher := agentclient.NewStreamDispatcher(agentRdb, cfg.AgentStreamKey(), logger)
+
+	// 웹 요청 컨슈머
+	router := handler.NewRouter(
+		handler.NewTaskDispatcher(
+			handler.NewHandler(s3, dispatcher, cfg, logger),
+			handler.NewDownloadHandler(s3, cfg, logger),
+			logger,
+		),
+		logger,
+	)
+	consumer := queue.NewConsumer(rdb, cfg, router, logger)
 	if err := consumer.EnsureGroup(ctx); err != nil {
 		logger.Error("failed to ensure consumer group", "error", err)
 		os.Exit(1)
 	}
+
+	// agent result consumer
+	agentResults := queue.NewAgentResultConsumer(agentRdb, rdb, cfg, handler.NewAgentResultMapper(logger), logger)
+	if err := agentResults.EnsureGroup(ctx); err != nil {
+		logger.Error("failed to ensure agent result consumer group", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("agent result consumer ready",
+		"stream", cfg.AgentResultStreamKey(), "group", cfg.AgentConsumerGroup(),
+		"resultStream", cfg.ResultStreamKey())
+	go agentResults.Run(ctx)
 
 	logger.Info("provisioner ready, consuming queue")
 	consumer.Run(ctx)
 	logger.Info("shutdown signal received, provisioner stopped")
 }
 
-// parseLogLevel maps LOG_LEVEL (debug/info/warn/error, case-insensitive) to
-// a slog.Level, defaulting to Info on anything unrecognized so a typo
-// doesn't silently suppress normal-severity logs.
 func parseLogLevel(s string) slog.Level {
 	switch strings.ToLower(s) {
 	case "debug":
@@ -92,9 +134,6 @@ func parseLogLevel(s string) slog.Level {
 	}
 }
 
-// waitForRedis retries the initial connection with backoff instead of
-// crash-looping the process when Redis isn't up yet (e.g. during a
-// docker-compose cold start where dependency ordering isn't guaranteed).
 func waitForRedis(ctx context.Context, rdb *redis.Client, logger *slog.Logger) error {
 	delay := 500 * time.Millisecond
 	const maxDelay = 30 * time.Second
