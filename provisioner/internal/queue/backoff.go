@@ -2,8 +2,8 @@ package queue
 
 import "time"
 
-// backoff is a simple doubling backoff capped at max, used while Redis is
-// unreachable so a Redis outage doesn't turn into a reconnect-storm.
+// Redis에 못 붙는 동안 재연결 간격을 2배씩 늘리다 max에서 멈추는 간단한 백오프.
+// Redis가 잠깐 죽어도 재연결 폭풍이 안 나게 한다.
 type backoff struct {
 	base    time.Duration
 	max     time.Duration
