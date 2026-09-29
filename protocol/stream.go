@@ -5,24 +5,21 @@ import (
 	"strconv"
 )
 
-// Redis Stream 위의 메시지 변환 (조율자 ↔ 에이전트).
-// 필수/선택이 Action에 따라 갈린다. CREATE는 빌드에 필요한 필드가 다 있어야 하고,
-// DESTROY는 UUID만 있으면 된다. 그래서 파싱은 먼저 action을 읽고 그에 맞춰 검사한다.
+// Redis Stream 파싱
+// DESTROY는 UUID만 필요
 
-// ── 조율자 → 에이전트 ──────────────────────────────────────────────────────
+// Provisioner -> Agent
 
 func (r RequestMessage) ToStreamValues() map[string]interface{} {
 	values := map[string]interface{}{
 		"uuid":   r.UUID,
 		"action": r.Action,
 	}
-	// 빈 값은 키째로 뺀다. DESTROY에 빈 challengeCode가 실려 있으면 받는 쪽이
-	// "코드가 빈 문제"로 읽는다.
 	if r.ChallengeCode != "" {
 		values["challengeCode"] = r.ChallengeCode
 	}
 	if r.IsolationType != "" {
-		values["isolationType"] = r.IsolationType
+		values["isolationType"] = string(r.IsolationType)
 	}
 	if r.FlagType != "" {
 		values["flagType"] = r.FlagType
@@ -51,7 +48,7 @@ func ParseRequestMessage(values map[string]interface{}) (*RequestMessage, error)
 		UUID:             uuid,
 		Action:           action,
 		ChallengeCode:    optionalString(values, "challengeCode"),
-		IsolationType:    optionalString(values, "isolationType"),
+		IsolationType:    IsolationType(optionalString(values, "isolationType")),
 		FlagType:         optionalString(values, "flagType"),
 		Flag:             optionalString(values, "flag"),
 		BuildContextPath: optionalString(values, "buildContextPath"),
@@ -61,7 +58,7 @@ func ParseRequestMessage(values map[string]interface{}) (*RequestMessage, error)
 	case ActionCreate:
 		for _, f := range []struct{ name, value string }{
 			{"challengeCode", req.ChallengeCode},
-			{"isolationType", req.IsolationType},
+			{"isolationType", string(req.IsolationType)},
 			{"flagType", req.FlagType},
 			{"buildContextPath", req.BuildContextPath},
 		} {
@@ -69,8 +66,15 @@ func ParseRequestMessage(values map[string]interface{}) (*RequestMessage, error)
 				return nil, fmt.Errorf("field %q is required for action %q", f.name, action)
 			}
 		}
+
+		if !req.IsolationType.Valid() {
+			return nil, fmt.Errorf("field %q has unknown value %q", "isolationType", req.IsolationType)
+		}
+		if req.IsolationType == IsolationShared && req.FlagType == FlagDynamic {
+			return nil, fmt.Errorf("isolationType %q cannot use flagType %q", IsolationShared, FlagDynamic)
+		}
 	case ActionDestroy:
-		// 어느 컨테이너인지는 에이전트가 uuid로 찾는다. 더 요구할 것이 없다.
+		// 어느 컨테이너인지는 에이전트가 uuid로 찾는다.
 	default:
 		return nil, fmt.Errorf("field %q has unknown value %q", "action", action)
 	}
@@ -78,7 +82,7 @@ func ParseRequestMessage(values map[string]interface{}) (*RequestMessage, error)
 	return req, nil
 }
 
-// ── 에이전트 → 조율자 ──────────────────────────────────────────────────────
+// Agent -> Provisioner
 
 func (r ResponseMessage) ToStreamValues() map[string]interface{} {
 	values := map[string]interface{}{
@@ -86,8 +90,7 @@ func (r ResponseMessage) ToStreamValues() map[string]interface{} {
 		"action": r.Action,
 		"status": r.Status,
 	}
-	// 실패면 아래는 전부 비어 있다. 빈 값을 실어 보내면 받는 쪽이 "0번 포트"처럼 읽을 수
-	// 있으므로, 있을 때만 싣는다.
+	// 실패인 경우 전부 비어 있다
 	if r.InstanceID != "" {
 		values["instanceId"] = r.InstanceID
 	}
@@ -134,8 +137,7 @@ func ParseResponseMessage(values map[string]interface{}) (*ResponseMessage, erro
 		ExpiresAt:  optionalString(values, "expiresAt"),
 		Message:    optionalString(values, "message"),
 	}
-	// 포트는 선택 필드다(실패 결과엔 없다). 있는데 숫자가 아니면 조용히 0으로 두지 않고
-	// 알린다 — 접속 못 하는 인스턴스를 READY로 넘기는 게 제일 나쁘다.
+
 	if raw := optionalString(values, "port"); raw != "" {
 		port, err := strconv.Atoi(raw)
 		if err != nil {
