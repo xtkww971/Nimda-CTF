@@ -1,277 +1,339 @@
-// 컨테이너 대신 docker CLI와 상호작용하는 프로세스
+// docker cli 모듈
 package runtime
 
 import (
 	"archive/tar"
-	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
+	"sort"
 	"strings"
+
+	"github.com/docker/docker/api/types/build"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/client"
+	"github.com/docker/go-connections/nat"
+	units "github.com/docker/go-units"
 )
 
-// Options tune how instances are run.
+// 인스턴스를 어떻게 띄울지 정하는 옵션.
 type Options struct {
-	// Runtime is the container runtime name passed to `docker --runtime`.
-	// Empty = the daemon default. In production this is "runsc" (gVisor,
-	// ADR-0008); on a dev host without gVisor leave it empty.
+	// 컨테이너 런타임 이름. 비우면 도커 기본값. 운영에선 "runsc"(gVisor, ADR-0008),
+	// gVisor 없는 개발 호스트에선 비워둔다.
 	Runtime string
 
-	// MemoryLimit / PidsLimit bound each instance (fork-bomb / memory-hog
-	// defense). Example: "256m", 256.
+	// 인스턴스마다 거는 메모리/프로세스 상한
 	MemoryLimit string
 	PidsLimit   int
 }
 
 type Docker struct {
+	cli  *client.Client
 	opts Options
 }
 
-func NewDocker(opts Options) *Docker {
-	return &Docker{opts: opts}
+func NewDocker(opts Options) (*Docker, error) {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return nil, fmt.Errorf("도커 데몬에 연결하지 못했습니다: %w", err)
+	}
+	return &Docker{cli: cli, opts: opts}, nil
 }
 
-// BuildImage extracts the build-context tar, finds the Dockerfile inside it,
-// and builds an image tagged imageTag. The challenge zip wraps its files in a
-// folder, so the Dockerfile may sit one level down - we locate it and build
-// from its directory.
-func (d *Docker) BuildImage(ctx context.Context, buildContext []byte, imageTag string) error {
-	tmp, err := os.MkdirTemp("", "ctf-build-*")
-	if err != nil {
-		return fmt.Errorf("빌드 임시 폴더 생성 실패: %w", err)
-	}
-	defer os.RemoveAll(tmp)
+func (d *Docker) Close() error { return d.cli.Close() }
 
-	if err := untar(buildContext, tmp); err != nil {
-		return fmt.Errorf("빌드 컨텍스트 해제 실패: %w", err)
-	}
-
-	contextDir, err := findDockerfileDir(tmp)
+// provisioner가 이미 압축을 풀어둔 sourceDir에서 Dockerfile을 찾아 imageTag로 이미지를 빌드
+func (d *Docker) BuildImageFromDir(ctx context.Context, sourceDir, imageTag string) error {
+	contextDir, err := findDockerfileDir(sourceDir)
 	if err != nil {
 		return err
 	}
 
-	out, err := d.run(ctx, "build", "-t", imageTag, contextDir)
+	tarStream, err := tarDir(contextDir)
 	if err != nil {
-		return fmt.Errorf("docker build 실패: %w\n%s", err, out)
+		return fmt.Errorf("빌드 컨텍스트 tar 생성 실패: %w", err)
 	}
-	return nil
+	defer tarStream.Close()
+
+	resp, err := d.cli.ImageBuild(ctx, tarStream, build.ImageBuildOptions{
+		Tags:       []string{imageTag},
+		Dockerfile: "Dockerfile",
+		Remove:     true, // 중간 컨테이너 정리
+	})
+	if err != nil {
+		return fmt.Errorf("이미지 빌드 요청 실패: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 빌드 실패는 HTTP 오류가 아니라 스트림 안의 errorDetail로 온다.
+	return drainBuildOutput(resp.Body)
 }
 
-// labelMarker tags every instance container so List can find them.
+// 인스턴스 컨테이너마다 붙이는 라벨.
 const labelMarker = "nimda.ctf"
 
-// Instance is one running challenge container as seen by List.
-type Instance struct {
-	ID            string
-	ChallengeCode string
-	UserID        int64
-	Port          int
-}
-
-// Run starts a container from imageTag, publishes its exposed port to a random
-// host port on 127.0.0.1, and returns the container id and that host port.
-// A container already using this name is removed first (fresh start). labels
-// are attached so List can later report this instance.
 func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map[string]string) (instanceID string, hostPort int, err error) {
 	containerPort, err := d.exposedPort(ctx, imageTag)
 	if err != nil {
 		return "", 0, err
 	}
 
-	// 같은 이름의 컨테이너 존재시 삭제 후 다시 빌드
-	_, _ = d.run(ctx, "rm", "-f", name)
+	// 같은 이름의 컨테이너가 있으면 지우고 다시 만든다.
+	// PER_USER만 삭제하고 SHARED의 경우 삭제하지 않는다.
+	_ = d.Remove(ctx, name)
 
-	args := []string{"run", "-d", "--name", name}
-	if d.opts.Runtime != "" {
-		args = append(args, "--runtime", d.opts.Runtime)
+	cfg := &container.Config{
+		Image:        imageTag,
+		Env:          envList(env),
+		Labels:       containerLabels(labels),
+		ExposedPorts: nat.PortSet{containerPort: struct{}{}},
 	}
-	// Hardening (ADR-0007 D4). Egress restriction is a network-policy concern
-	// handled at deploy time, not here.
-	args = append(args,
-		"--cap-drop", "ALL",
-		"--security-opt", "no-new-privileges",
-	)
+
+	hostCfg := &container.HostConfig{
+		Runtime:     d.opts.Runtime, // 빈 값이면 데몬 기본값
+		CapDrop:     []string{"ALL"},
+		SecurityOpt: []string{"no-new-privileges"},
+		// 컨테이너 EXPOSE 포트를 loopback의 랜덤 host 포트에 연다.
+		PortBindings: nat.PortMap{
+			containerPort: []nat.PortBinding{{HostIP: "127.0.0.1", HostPort: ""}},
+		},
+	}
 	if d.opts.MemoryLimit != "" {
-		args = append(args, "--memory", d.opts.MemoryLimit)
+		// CLI는 "256m" 같은 문자열을 받았지만 API는 바이트 수를 받는다.
+		limit, err := units.RAMInBytes(d.opts.MemoryLimit)
+		if err != nil {
+			return "", 0, fmt.Errorf("메모리 상한 값을 해석하지 못했습니다 (%q): %w", d.opts.MemoryLimit, err)
+		}
+		hostCfg.Memory = limit
 	}
 	if d.opts.PidsLimit > 0 {
-		args = append(args, "--pids-limit", fmt.Sprintf("%d", d.opts.PidsLimit))
+		limit := int64(d.opts.PidsLimit)
+		hostCfg.PidsLimit = &limit
 	}
-	args = append(args, "--label", labelMarker+"=1")
-	for k, v := range labels {
-		args = append(args, "--label", k+"="+v)
-	}
-	for k, v := range env {
-		args = append(args, "--env", k+"="+v)
-	}
-	// Publish the container's exposed port to a random host port on loopback.
-	args = append(args, "-p", "127.0.0.1:0:"+containerPort, imageTag)
 
-	out, err := d.run(ctx, args...)
+	created, err := d.cli.ContainerCreate(ctx, cfg, hostCfg, &network.NetworkingConfig{}, nil, name)
 	if err != nil {
-		return "", 0, fmt.Errorf("docker run 실패: %w\n%s", err, out)
+		return "", 0, fmt.Errorf("컨테이너 생성 실패: %w", err)
 	}
-	instanceID = strings.TrimSpace(out)
+	instanceID = created.ID
 
-	// 생성했지만 접근하지 못할 때 삭제
-	hostPort, err = d.publishedPort(ctx, name, containerPort)
+	if err := d.cli.ContainerStart(ctx, instanceID, container.StartOptions{}); err != nil {
+		// 만들었지만 못 띄웠다. 메모리 누수를 차단하기 위해 삭제
+		_ = d.Remove(ctx, name)
+		return "", 0, fmt.Errorf("컨테이너 실행 실패: %w", err)
+	}
+
+	// 데몬이 고른 host 포트는 띄운 뒤에야 정해진다.
+	hostPort, err = d.publishedPort(ctx, instanceID, containerPort)
 	if err != nil {
-		// Container is up but we couldn't read its port - tear it down so we
-		// don't leak it, and report failure.
-		_, _ = d.run(ctx, "rm", "-f", name)
+		_ = d.Remove(ctx, name)
 		return "", 0, err
 	}
 	return instanceID, hostPort, nil
 }
 
-// 작동 컨테이너 확인
-func (d *Docker) Running(ctx context.Context, name string) (running bool, hostPort int, err error) {
-	out, err := d.run(ctx, "inspect", "--format", "{{.State.Running}}", name)
+// 컨테이너가 떠 있는지와 열린 host 포트.
+func (d *Docker) Running(ctx context.Context, nameOrID string) (running bool, hostPort int, err error) {
+	info, err := d.cli.ContainerInspect(ctx, nameOrID)
 	if err != nil {
-		// No such container.
+		// 컨테이너가 존재하지 않음. 조회 실패와 구분하지 않는다
 		return false, 0, nil
 	}
-	if strings.TrimSpace(out) != "true" {
+	if info.State == nil || !info.State.Running {
 		return false, 0, nil
 	}
-	containerPort, err := d.exposedPortOfContainer(ctx, name)
+
+	port, err := firstExposedPort(info.Config.ExposedPorts)
+	if err != nil {
+		return true, 0, nil // 떠 있지만 포트를 모른다
+	}
+	hostPort, err = portFromBindings(info.NetworkSettings.Ports, port)
 	if err != nil {
 		return true, 0, nil
 	}
-	port, err := d.publishedPort(ctx, name, containerPort)
-	if err != nil {
-		return true, 0, nil
-	}
-	return true, port, nil
+	return true, hostPort, nil
 }
 
-// 작동 중인 컨테이너 확인
-func (d *Docker) List(ctx context.Context) ([]Instance, error) {
-	const format = "{{.ID}}|{{.Label \"nimda.ctf.code\"}}|{{.Label \"nimda.ctf.user\"}}|{{.Ports}}"
-	out, err := d.run(ctx, "ps", "--filter", "label="+labelMarker, "--format", format)
-	if err != nil {
-		return nil, fmt.Errorf("docker ps 실패: %w\n%s", err, out)
-	}
-
-	var instances []Instance
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if line == "" {
-			continue
-		}
-		parts := strings.Split(line, "|")
-		if len(parts) < 4 {
-			continue
-		}
-		inst := Instance{ID: parts[0], ChallengeCode: parts[1], Port: parsePortsColumn(parts[3])}
-		if parts[2] != "" {
-			if uid, perr := strconv.ParseInt(parts[2], 10, 64); perr == nil {
-				inst.UserID = uid
-			}
-		}
-		instances = append(instances, inst)
-	}
-	return instances, nil
-}
-
-// parsePortsColumn pulls the host port out of docker ps's Ports column, e.g.
-// "127.0.0.1:32768->8080/tcp" -> 32768. Returns 0 if none is published.
-func parsePortsColumn(s string) int {
-	first := strings.TrimSpace(strings.Split(s, ",")[0]) // first mapping
-	arrow := strings.Index(first, "->")
-	if arrow < 0 {
-		return 0
-	}
-	hostPart := first[:arrow] // "127.0.0.1:32768"
-	idx := strings.LastIndex(hostPart, ":")
-	if idx < 0 {
-		return 0
-	}
-	var port int
-	if _, err := fmt.Sscanf(hostPart[idx+1:], "%d", &port); err != nil {
-		return 0
-	}
-	return port
-}
-
-// 컨테이너 삭제
-func (d *Docker) Remove(ctx context.Context, name string) error {
-	out, err := d.run(ctx, "rm", "-f", name)
-	if err != nil && !strings.Contains(out, "No such container") {
-		return fmt.Errorf("docker rm 실패: %w\n%s", err, out)
+// 컨테이너를 삭제 없는 컨테이너는 성공으로 판단
+func (d *Docker) Remove(ctx context.Context, nameOrID string) error {
+	err := d.cli.ContainerRemove(ctx, nameOrID, container.RemoveOptions{Force: true})
+	if err != nil && !client.IsErrNotFound(err) {
+		return fmt.Errorf("컨테이너 삭제 실패: %w", err)
 	}
 	return nil
 }
 
-// 이미지 삭제
 func (d *Docker) RemoveImage(ctx context.Context, imageTag string) {
-	_, _ = d.run(ctx, "rmi", "-f", imageTag)
+	_, _ = d.cli.ImageRemove(ctx, imageTag, image.RemoveOptions{Force: true})
 }
 
-// exposedPort reads the first EXPOSEd port of an image, e.g. "5000/tcp".
-func (d *Docker) exposedPort(ctx context.Context, imageTag string) (string, error) {
-	out, err := d.run(ctx, "inspect", "--format",
-		"{{range $p, $v := .Config.ExposedPorts}}{{$p}} {{end}}", imageTag)
+// 이미지가 EXPOSE한 포트를 읽는다. 예: "5000/tcp".
+func (d *Docker) exposedPort(ctx context.Context, imageTag string) (nat.Port, error) {
+	info, err := d.cli.ImageInspect(ctx, imageTag)
 	if err != nil {
-		return "", fmt.Errorf("이미지 EXPOSE 포트 조회 실패: %w\n%s", err, out)
+		return "", fmt.Errorf("이미지 EXPOSE 포트 조회 실패: %w", err)
 	}
-	fields := strings.Fields(out)
-	if len(fields) == 0 {
+	if info.Config == nil {
 		return "", fmt.Errorf("이미지 %s 에 EXPOSE된 포트가 없습니다 (Dockerfile에 EXPOSE 필요)", imageTag)
 	}
-	return fields[0], nil
-}
-
-func (d *Docker) exposedPortOfContainer(ctx context.Context, name string) (string, error) {
-	out, err := d.run(ctx, "inspect", "--format",
-		"{{range $p, $v := .Config.ExposedPorts}}{{$p}} {{end}}", name)
+	port, err := firstExposedPort(info.Config.ExposedPorts)
 	if err != nil {
-		return "", err
-	}
-	fields := strings.Fields(out)
-	if len(fields) == 0 {
-		return "", fmt.Errorf("no exposed port")
-	}
-	return fields[0], nil
-}
-
-// publishedPort reads the host port a container port was mapped to, from
-// `docker port <name> <containerPort>` -> "127.0.0.1:49153".
-func (d *Docker) publishedPort(ctx context.Context, name, containerPort string) (int, error) {
-	out, err := d.run(ctx, "port", name, containerPort)
-	if err != nil {
-		return 0, fmt.Errorf("host 포트 조회 실패: %w\n%s", err, out)
-	}
-	line := strings.TrimSpace(out)
-	if i := strings.IndexByte(line, '\n'); i >= 0 {
-		line = line[:i]
-	}
-	idx := strings.LastIndex(line, ":")
-	if idx < 0 {
-		return 0, fmt.Errorf("host 포트 형식을 해석 못함: %q", line)
-	}
-	var port int
-	if _, err := fmt.Sscanf(line[idx+1:], "%d", &port); err != nil {
-		return 0, fmt.Errorf("host 포트 숫자 파싱 실패: %q", line)
+		return "", fmt.Errorf("이미지 %s 에 EXPOSE된 포트가 없습니다 (Dockerfile에 EXPOSE 필요)", imageTag)
 	}
 	return port, nil
 }
 
-func (d *Docker) run(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
-	err := cmd.Run()
-	return buf.String(), err
+// 데몬이 이 컨테이너 포트를 어느 host 포트에 열었는지 읽는다.
+func (d *Docker) publishedPort(ctx context.Context, containerID string, port nat.Port) (int, error) {
+	info, err := d.cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return 0, fmt.Errorf("host 포트 조회 실패: %w", err)
+	}
+	return portFromBindings(info.NetworkSettings.Ports, port)
 }
 
-// findDockerfileDir returns the shallowest directory under root containing a
-// file named "Dockerfile".
+func portFromBindings(ports nat.PortMap, port nat.Port) (int, error) {
+	bindings := ports[port]
+	if len(bindings) == 0 {
+		return 0, fmt.Errorf("컨테이너 포트 %s 가 host에 열려 있지 않습니다", port)
+	}
+	var hostPort int
+	if _, err := fmt.Sscanf(bindings[0].HostPort, "%d", &hostPort); err != nil {
+		return 0, fmt.Errorf("host 포트 숫자 파싱 실패: %q", bindings[0].HostPort)
+	}
+	return hostPort, nil
+}
+
+// EXPOSE된 포트 중 하나를 고른다.
+//
+// 정렬해서 가장 앞을 쓴다. Go의 맵 순회는 순서가 매번 달라서, 정렬하지 않으면 EXPOSE가
+// 둘 이상인 이미지가 실행할 때마다 다른 포트를 열게 된다.
+// 타입 매개변수를 쓰는 이유: 같은 "EXPOSE된 포트 집합"인데 어디서 읽느냐에 따라 맵의 키
+// 타입이 다르다. 컨테이너를 inspect하면 nat.PortSet(map[nat.Port]struct{})이고,
+// 이미지를 inspect하면 OCI 이미지 설정이라 map[string]struct{}다.
+func firstExposedPort[K ~string](ports map[K]struct{}) (nat.Port, error) {
+	if len(ports) == 0 {
+		return "", fmt.Errorf("EXPOSE된 포트 없음")
+	}
+	keys := make([]string, 0, len(ports))
+	for p := range ports {
+		keys = append(keys, string(p))
+	}
+	sort.Strings(keys)
+	return nat.Port(keys[0]), nil
+}
+
+func envList(env map[string]string) []string {
+	if len(env) == 0 {
+		return nil
+	}
+	list := make([]string, 0, len(env))
+	for k, v := range env {
+		list = append(list, k+"="+v)
+	}
+	sort.Strings(list) // 재현 가능하게
+	return list
+}
+
+func containerLabels(labels map[string]string) map[string]string {
+	out := make(map[string]string, len(labels)+1)
+	for k, v := range labels {
+		out[k] = v
+	}
+	out[labelMarker] = "1"
+	return out
+}
+
+// 빌드 출력 스트림을 끝까지 읽으면서 실패를 찾는다.
+func drainBuildOutput(r io.Reader) error {
+	dec := json.NewDecoder(r)
+	for {
+		var line struct {
+			Stream      string `json:"stream"`
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if err := dec.Decode(&line); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("빌드 출력 해석 실패: %w", err)
+		}
+		if line.Error != "" || line.ErrorDetail.Message != "" {
+			msg := line.ErrorDetail.Message
+			if msg == "" {
+				msg = line.Error
+			}
+			return fmt.Errorf("도커 빌드 실패: %s", msg)
+		}
+	}
+}
+
+// 폴더를 tar 스트림으로 만든다. 데몬이 빌드 컨텍스트를 이 형식으로 받는다.
+func tarDir(dir string) (io.ReadCloser, error) {
+	if _, err := os.Stat(dir); err != nil {
+		return nil, err
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		tw := tar.NewWriter(pw)
+		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.Mode().IsRegular() && !info.IsDir() {
+				return nil
+			}
+
+			rel, err := filepath.Rel(dir, path)
+			if err != nil {
+				return err
+			}
+			if rel == "." {
+				return nil
+			}
+
+			hdr, err := tar.FileInfoHeader(info, "")
+			if err != nil {
+				return err
+			}
+			hdr.Name = filepath.ToSlash(rel)
+			if err := tw.WriteHeader(hdr); err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return nil
+			}
+
+			f, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			_, err = io.Copy(tw, f)
+			return err
+		})
+		if err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		if err := tw.Close(); err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		pw.Close()
+	}()
+	return pr, nil
+}
+
 func findDockerfileDir(root string) (string, error) {
 	var found string
 	bestDepth := -1
@@ -296,41 +358,4 @@ func findDockerfileDir(root string) (string, error) {
 		return "", fmt.Errorf("빌드 컨텍스트에 Dockerfile이 없습니다")
 	}
 	return found, nil
-}
-
-// untar extracts a tar into dest, guarding against path traversal (tar-slip).
-func untar(tarData []byte, dest string) error {
-	tr := tar.NewReader(bytes.NewReader(tarData))
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(dest, hdr.Name)
-		if !strings.HasPrefix(target, filepath.Clean(dest)+string(os.PathSeparator)) {
-			return fmt.Errorf("잘못된 경로(tar-slip): %s", hdr.Name)
-		}
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o755); err != nil {
-				return err
-			}
-		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777)
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(f, tr); err != nil {
-				f.Close()
-				return err
-			}
-			f.Close()
-		}
-	}
 }
