@@ -40,7 +40,7 @@ func (h *DockerHandler) Create(ctx context.Context, req *protocol.RequestMessage
 		return failed(req.UUID, err.Error())
 	}
 	image := "ctf-chal-" + code + ":latest"
-	name, err := instanceName(code, req.IsolationType, req.UUID)
+	name, err := instanceName(code, string(req.IsolationType), req.UUID)
 	if err != nil {
 		return failed(req.UUID, err.Error())
 	}
