@@ -96,7 +96,7 @@ func (h *Handler) Handle(ctx context.Context, msg *CreateInstanceMessage) (*queu
 		UUID:             msg.UUID,
 		Action:           protocol.ActionCreate,
 		ChallengeCode:    msg.ChallengeCode,
-		IsolationType:    msg.IsolationType,
+		IsolationType:    protocol.IsolationType(msg.IsolationType),
 		FlagType:         msg.FlagType,
 		BuildContextPath: dir,
 		// Flag(DYNAMIC 주입값)은 플래그 설계 확정 후. 지금은 비움.
