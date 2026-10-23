@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"nimda-ctf-agent/internal/registry"
 	protocol "nimda-ctf-protocol"
 )
 
@@ -45,11 +47,25 @@ func (f *fakeInstances) Existing(_ context.Context, _, _ string) *protocol.Respo
 
 // 메모리 registry.
 type fakeRegistry struct {
-	saved   map[string]string
+	saved   map[string]string // PER_USER: uuid → instanceID
 	readErr error
+
+	joined  map[string]string               // SHARED: uuid → challengeCode
+	leases  map[string]map[string]time.Time // code → uuid → 만료 시각
+	shared  map[string]string               // code → instanceID
+	locked  map[string]bool                 // code → lock 잡힘
+	unlocks int
 }
 
-func newFakeRegistry() *fakeRegistry { return &fakeRegistry{saved: map[string]string{}} }
+func newFakeRegistry() *fakeRegistry {
+	return &fakeRegistry{
+		saved:  map[string]string{},
+		joined: map[string]string{},
+		leases: map[string]map[string]time.Time{},
+		shared: map[string]string{},
+		locked: map[string]bool{},
+	}
+}
 
 func (r *fakeRegistry) Save(_ context.Context, uuid, instanceID string) error {
 	r.saved[uuid] = instanceID
@@ -68,8 +84,75 @@ func (r *fakeRegistry) Delete(_ context.Context, uuid string) error {
 	return nil
 }
 
+func (r *fakeRegistry) Entry(_ context.Context, uuid string) (*registry.Entry, error) {
+	if r.readErr != nil {
+		return nil, r.readErr
+	}
+	if id, ok := r.saved[uuid]; ok {
+		return &registry.Entry{Isolation: protocol.IsolationPerUser, InstanceID: id}, nil
+	}
+	if code, ok := r.joined[uuid]; ok {
+		return &registry.Entry{Isolation: protocol.IsolationShared, ChallengeCode: code,
+			ExpiresAt: r.leases[code][uuid]}, nil
+	}
+	return nil, nil
+}
+
+func (r *fakeRegistry) Shared(_ context.Context, code string) (*registry.SharedInstance, error) {
+	if r.readErr != nil {
+		return nil, r.readErr
+	}
+	id, ok := r.shared[code]
+	if !ok {
+		return nil, nil
+	}
+	return &registry.SharedInstance{InstanceID: id}, nil
+}
+
+func (r *fakeRegistry) SaveShared(_ context.Context, code, instanceID string) error {
+	r.shared[code] = instanceID
+	return nil
+}
+
+// 실제 registry처럼 이미 lease가 있으면 만료 시각을 바꾸지 않는다(ZADD NX).
+func (r *fakeRegistry) Join(_ context.Context, code, uuid string, expiresAt time.Time) (time.Time, error) {
+	if r.leases[code] == nil {
+		r.leases[code] = map[string]time.Time{}
+	}
+	if existing, ok := r.leases[code][uuid]; ok {
+		return existing, nil
+	}
+	r.leases[code][uuid] = expiresAt
+	r.joined[uuid] = code
+	return expiresAt, nil
+}
+
+func (r *fakeRegistry) Leave(_ context.Context, code, uuid string) error {
+	delete(r.leases[code], uuid)
+	delete(r.joined, uuid)
+	return nil
+}
+
+func (r *fakeRegistry) Lock(_ context.Context, code string, _ time.Duration) (string, bool, error) {
+	if r.locked[code] {
+		return "", false, nil
+	}
+	r.locked[code] = true
+	return "token-" + code, true, nil
+}
+
+func (r *fakeRegistry) Unlock(_ context.Context, code, _ string) error {
+	r.locked[code] = false
+	r.unlocks++
+	return nil
+}
+
 func newDispatcher(inst *fakeInstances, reg *fakeRegistry) *Dispatcher {
-	return NewDispatcher(inst, reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	d := NewDispatcher(inst, reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// lock 대기 테스트가 오래 걸리지 않게 줄인다.
+	d.lockRetryInterval = 5 * time.Millisecond
+	d.lockWaitTimeout = 20 * time.Millisecond
+	return d
 }
 
 // 빌드 컨텍스트로 쓸 폴더를 하나 만들어 경로를 돌려준다.
@@ -227,5 +310,168 @@ func TestDestroyWithoutRecord(t *testing.T) {
 	}
 	if res.Status != protocol.StatusNotFound {
 		t.Errorf("status = %q, want NOT_FOUND", res.Status)
+	}
+}
+
+// ── SHARED (ADR-0019) ──────────────────────────────────────────────────────
+
+func sharedReq(uuid, dir string) *protocol.RequestMessage {
+	r := createReq(uuid, dir)
+	r.IsolationType = protocol.IsolationShared
+	return r
+}
+
+// 첫 참가자는 빌드하고, shared:{code}와 lease를 저장한다.
+func TestSharedFirstJoinBuildsAndSaves(t *testing.T) {
+	inst, reg := &fakeInstances{}, newFakeRegistry()
+	res, err := newDispatcher(inst, reg).Handle(context.Background(), sharedReq("uuid-a", buildDir(t)))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != protocol.StatusReady {
+		t.Fatalf("status = %q (%s), want READY", res.Status, res.Message)
+	}
+	if inst.createCalls != 1 {
+		t.Errorf("Create 호출 = %d, want 1", inst.createCalls)
+	}
+	if reg.shared["web-basic-01"] != "new-container" {
+		t.Errorf("shared:{code}가 저장되지 않음: %+v", reg.shared)
+	}
+	if _, ok := reg.leases["web-basic-01"]["uuid-a"]; !ok {
+		t.Errorf("lease가 저장되지 않음: %+v", reg.leases)
+	}
+	if res.ExpiresAt == "" {
+		t.Error("SHARED 응답에 expiresAt(lease 만료 시각)이 없음")
+	}
+	if reg.locked["web-basic-01"] {
+		t.Error("lock이 풀리지 않음")
+	}
+}
+
+// 두 번째 참가자는 빌드하지 않고 같은 컨테이너에 붙는다. PER_USER처럼 지우고 다시 만들면 안 된다.
+func TestSharedSecondJoinReusesContainer(t *testing.T) {
+	inst := &fakeInstances{existing: &protocol.ResponseMessage{
+		Action: protocol.ActionCreate, Status: protocol.StatusReady,
+		InstanceID: "shared-container", Host: "127.0.0.1", Port: 30000,
+	}}
+	reg := newFakeRegistry()
+	reg.shared["web-basic-01"] = "shared-container"
+
+	res, err := newDispatcher(inst, reg).Handle(context.Background(), sharedReq("uuid-b", buildDir(t)))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if inst.createCalls != 0 {
+		t.Errorf("떠 있는데 다시 빌드함 (Create 호출 %d회)", inst.createCalls)
+	}
+	if res.UUID != "uuid-b" || res.InstanceID != "shared-container" || res.Port != 30000 {
+		t.Errorf("기존 공유 컨테이너 정보가 아님: %+v", res)
+	}
+	if _, ok := reg.leases["web-basic-01"]["uuid-b"]; !ok {
+		t.Error("두 번째 참가자의 lease가 없음")
+	}
+}
+
+// 기록은 있는데 공유 컨테이너가 죽었으면 다시 만들고 instanceId를 교체한다.
+func TestSharedRebuildsWhenContainerGone(t *testing.T) {
+	inst := &fakeInstances{existing: nil}
+	reg := newFakeRegistry()
+	reg.shared["web-basic-01"] = "dead-container"
+
+	if _, err := newDispatcher(inst, reg).Handle(context.Background(), sharedReq("uuid-a", buildDir(t))); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if inst.createCalls != 1 {
+		t.Errorf("Create 호출 = %d, want 1", inst.createCalls)
+	}
+	if reg.shared["web-basic-01"] != "new-container" {
+		t.Errorf("instanceId가 교체되지 않음: %+v", reg.shared)
+	}
+}
+
+// 같은 요청이 redelivery되면 lease가 연장되면 안 된다. 응답의 expiresAt도 처음 값이어야 한다.
+func TestSharedRedeliveryKeepsLease(t *testing.T) {
+	inst, reg := &fakeInstances{}, newFakeRegistry()
+	d := newDispatcher(inst, reg)
+	base := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	d.now = func() time.Time { return base }
+
+	first, _ := d.Handle(context.Background(), sharedReq("uuid-a", buildDir(t)))
+
+	inst.existing = &protocol.ResponseMessage{Status: protocol.StatusReady, InstanceID: "new-container"}
+	d.now = func() time.Time { return base.Add(30 * time.Minute) }
+	second, _ := d.Handle(context.Background(), sharedReq("uuid-a", buildDir(t)))
+
+	if first.ExpiresAt != second.ExpiresAt {
+		t.Errorf("redelivery로 lease가 바뀜: %s → %s", first.ExpiresAt, second.ExpiresAt)
+	}
+}
+
+// lock을 못 잡으면 잠깐 기다리다가 FAILED. 웹이 PENDING에 갇히지 않게 에러가 아니라 응답으로 준다.
+func TestSharedLockTimeoutReturnsFailed(t *testing.T) {
+	inst, reg := &fakeInstances{}, newFakeRegistry()
+	reg.locked["web-basic-01"] = true // 다른 쪽이 잡고 있다
+	dir := buildDir(t)
+
+	res, err := newDispatcher(inst, reg).Handle(context.Background(), sharedReq("uuid-a", dir))
+	if err != nil {
+		t.Fatalf("lock 실패는 에러가 아니라 FAILED 응답이어야 함: %v", err)
+	}
+	if res.Status != protocol.StatusFailed {
+		t.Errorf("status = %q, want FAILED", res.Status)
+	}
+	if inst.createCalls != 0 {
+		t.Errorf("lock 없이 빌드함 (Create 호출 %d회)", inst.createCalls)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("빌드 폴더가 남아 있습니다: %s", dir)
+	}
+}
+
+// SHARED DESTROY는 자기 lease만 반납한다. 컨테이너와 다른 참가자는 그대로다.
+func TestSharedDestroyOnlyLeaves(t *testing.T) {
+	inst, reg := &fakeInstances{}, newFakeRegistry()
+	reg.shared["web-basic-01"] = "shared-container"
+	exp := time.Now().Add(time.Hour)
+	reg.Join(context.Background(), "web-basic-01", "uuid-a", exp)
+	reg.Join(context.Background(), "web-basic-01", "uuid-b", exp)
+
+	res, err := newDispatcher(inst, reg).Handle(context.Background(),
+		&protocol.RequestMessage{UUID: "uuid-a", Action: protocol.ActionDestroy})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != protocol.StatusDestroyed {
+		t.Errorf("status = %q, want DESTROYED", res.Status)
+	}
+	if inst.destroyCalls != 0 {
+		t.Errorf("공유 컨테이너를 지움 (Destroy 호출 %d회)", inst.destroyCalls)
+	}
+	if _, ok := reg.leases["web-basic-01"]["uuid-a"]; ok {
+		t.Error("a의 lease가 남아 있음")
+	}
+	if _, ok := reg.leases["web-basic-01"]["uuid-b"]; !ok {
+		t.Error("b의 lease가 사라짐")
+	}
+	if reg.shared["web-basic-01"] != "shared-container" {
+		t.Error("공유 컨테이너 기록이 사라짐")
+	}
+}
+
+// 모르는 isolationType은 만들지 않는다. 덜 격리된 쪽으로 흘려보내면 안 된다.
+func TestCreateRejectsUnknownIsolation(t *testing.T) {
+	inst := &fakeInstances{}
+	req := createReq("uuid-x", buildDir(t))
+	req.IsolationType = "PER-USER"
+
+	res, err := newDispatcher(inst, newFakeRegistry()).Handle(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != protocol.StatusFailed {
+		t.Errorf("status = %q, want FAILED", res.Status)
+	}
+	if inst.createCalls != 0 {
+		t.Errorf("모르는 값인데 만들었음 (Create 호출 %d회)", inst.createCalls)
 	}
 }
