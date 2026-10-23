@@ -21,6 +21,7 @@ import (
 
 	"nimda-ctf-agent/internal/agentqueue"
 	"nimda-ctf-agent/internal/agentserver"
+	"nimda-ctf-agent/internal/monitor"
 	"nimda-ctf-agent/internal/registry"
 	"nimda-ctf-agent/internal/runtime"
 )
@@ -73,7 +74,8 @@ func main() {
 		ReconnectMax:  getenvDuration("CTF_QUEUE_RECONNECT_MAX_DELAY", 30*time.Second),
 	}
 
-	dispatcher := agentqueue.NewDispatcher(instances, registry.New(rdb), logger)
+	reg := registry.New(rdb)
+	dispatcher := agentqueue.NewDispatcher(instances, reg, logger)
 	consumer := agentqueue.NewConsumer(rdb, opts, dispatcher, logger)
 	if err := consumer.EnsureGroup(ctx); err != nil {
 		logger.Error("failed to ensure consumer group",
@@ -84,6 +86,10 @@ func main() {
 	logger.Info("agent ready, consuming queue",
 		"stream", opts.Stream, "group", opts.Group, "consumer", opts.Consumer,
 		"resultStream", opts.ResultStream, "instanceHost", host, "buildRoot", buildRoot)
+
+	// 대시보드가 볼 snapshot을 주기적으로 ctf-redis에 쓴다 (Feature-01).
+	// agent는 listener를 열지 않기 때문에 이게 대시보드로 가는 유일한 통로다.
+	go monitor.New(rt, reg, rdb, logger).Run(ctx)
 
 	consumer.Run(ctx)
 	logger.Info("shutdown signal received, agent stopped")
