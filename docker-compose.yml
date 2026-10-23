@@ -66,6 +66,26 @@ services:
       - ctf-internal
       - nimda-network
 
+  # 인스턴스 모니터링 화면 (Feature-01). agent가 쓴 monitor:snapshot을 읽어 보여주기만 한다.
+  # nimda-network에 붙이지 않는다. 웹이 뚫려도 대시보드에는 닿지 않게 하기 위해서다.
+  # 호스트의 127.0.0.1에만 열고, 서버에서는 SSH 터널로 접근한다.
+  #   ssh -L 6070:127.0.0.1:6070 사용자@서버주소  →  브라우저에서 http://localhost:6070
+  dashboard:
+    container_name: ctf-dashboard
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    environment:
+      - CTF_DASHBOARD_ADDR=:6070
+      - CTF_DASHBOARD_REDIS_ADDR=ctf-redis:6379
+    ports:
+      - "127.0.0.1:6070:6070"
+    depends_on:
+      ctf-redis:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+
 volumes:
   ctf-build:
 
