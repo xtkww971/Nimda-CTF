@@ -1,5 +1,10 @@
 go 1.26.1
 
 use ./provisioner
+
 use ./protocol
-use ./agent
+
+use (
+	./agent
+	./dashboard
+)
