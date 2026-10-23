@@ -89,6 +89,46 @@ func TestRequestRejectsUnknownAction(t *testing.T) {
 	}
 }
 
+// SHARED도 PER_USER와 같은 메시지 모양이다. 값만 달라지고 한 바퀴 돌려도 그대로여야 한다.
+func TestSharedRequestRoundTrip(t *testing.T) {
+	in := createRequest()
+	in.IsolationType = IsolationShared
+	in.FlagType = FlagStatic
+	in.Flag = ""
+
+	out, err := ParseRequestMessage(in.ToStreamValues())
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if *out != in {
+		t.Errorf("round trip changed the request:\n got %+v\nwant %+v", *out, in)
+	}
+}
+
+// 모르는 격리 방식은 어느 쪽으로도 흘려보내지 않는다. 오타가 공용 컨테이너로 이어지면
+// pwn 문제가 모두에게 열린다.
+func TestCreateRequestRejectsUnknownIsolation(t *testing.T) {
+	for _, v := range []string{"PER-USER", "shared", "NONE"} {
+		values := createRequest().ToStreamValues()
+		values["isolationType"] = v
+
+		if _, err := ParseRequestMessage(values); err == nil {
+			t.Errorf("isolationType=%q인데 파싱이 성공했습니다", v)
+		}
+	}
+}
+
+// 공유 컨테이너는 하나라 플래그도 하나다. DYNAMIC을 받으면 참가자 플래그가 서로 덮어쓴다.
+func TestCreateRequestRejectsSharedDynamic(t *testing.T) {
+	in := createRequest()
+	in.IsolationType = IsolationShared
+	in.FlagType = FlagDynamic
+
+	if _, err := ParseRequestMessage(in.ToStreamValues()); err == nil {
+		t.Error("SHARED + DYNAMIC인데 파싱이 성공했습니다")
+	}
+}
+
 func TestResponseRoundTrip(t *testing.T) {
 	in := ResponseMessage{
 		UUID:       "9f1c-req-1",
