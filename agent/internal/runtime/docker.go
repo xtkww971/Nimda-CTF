@@ -11,9 +11,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types/build"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
@@ -157,6 +159,48 @@ func (d *Docker) Running(ctx context.Context, nameOrID string) (running bool, ho
 		return true, 0, nil
 	}
 	return true, hostPort, nil
+}
+
+// 모니터링에 쓰는 컨테이너 정보 (Feature-01).
+type ContainerInfo struct {
+	ID       string
+	Name     string
+	Labels   map[string]string
+	Running  bool
+	Created  time.Time
+	HostPort int // 열린 host 포트. 없으면 0
+}
+
+// nimda.ctf 라벨이 붙은 컨테이너를 전부 가져온다. 멈춘 것도 포함한다.
+// orphan(registry에 기록이 없는 컨테이너)을 찾으려면 멈춘 것까지 봐야 하기 때문이다.
+func (d *Docker) List(ctx context.Context) ([]ContainerInfo, error) {
+	list, err := d.cli.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("label", labelMarker)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("컨테이너 목록 조회 실패: %w", err)
+	}
+	out := make([]ContainerInfo, 0, len(list))
+	for _, c := range list {
+		info := ContainerInfo{
+			ID:      c.ID,
+			Labels:  c.Labels,
+			Running: c.State == "running",
+			Created: time.Unix(c.Created, 0).UTC(),
+		}
+		if len(c.Names) > 0 {
+			info.Name = strings.TrimPrefix(c.Names[0], "/")
+		}
+		for _, p := range c.Ports {
+			if p.PublicPort != 0 {
+				info.HostPort = int(p.PublicPort)
+				break
+			}
+		}
+		out = append(out, info)
+	}
+	return out, nil
 }
 
 // 컨테이너를 삭제 없는 컨테이너는 성공으로 판단
