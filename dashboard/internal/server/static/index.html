@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CTF 인스턴스 모니터링</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #6b7280; --line: #e5e7eb;
+    --ok: #15803d; --ok-bg: #dcfce7; --warn: #b45309; --warn-bg: #fef3c7; --bad: #b91c1c; --bad-bg: #fee2e2;
+    --accent: #2563eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1218; --panel: #171b23; --text: #e5e7eb; --muted: #9ca3af; --line: #2a303b;
+      --ok: #4ade80; --ok-bg: #14321f; --warn: #fbbf24; --warn-bg: #3a2e10; --bad: #f87171; --bad-bg: #3b1616;
+      --accent: #60a5fa;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "Noto Sans KR", sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 15px; margin: 28px 0 10px; }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12.5px; }
+  .banner { display: none; margin: 16px 0 0; padding: 10px 14px; border-radius: 8px;
+            background: var(--bad-bg); color: var(--bad); font-weight: 600; }
+  .banner.show { display: block; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-top: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .card .n { font-size: 24px; font-weight: 700; }
+  .card .l { color: var(--muted); font-size: 12px; }
+  .wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  tr.expandable { cursor: pointer; }
+  tr.expandable:hover td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+  tr.leases td { background: var(--bg); padding: 0 12px 10px 36px; }
+  tr.leases table th, tr.leases table td { padding: 6px 10px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .RUNNING { background: var(--ok-bg); color: var(--ok); }
+  .EXITED { background: var(--warn-bg); color: var(--warn); }
+  .MISSING, .expired { background: var(--bad-bg); color: var(--bad); }
+  .empty { padding: 14px; color: var(--muted); }
+  .stale { opacity: .45; }
+  .caret { display: inline-block; width: 1em; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>CTF 인스턴스 모니터링</h1>
+    <span class="muted" id="updated">불러오는 중…</span>
+  </header>
+  <div class="banner" id="banner"></div>
+
+  <div id="content">
+    <div class="cards" id="cards"></div>
+
+    <h2>SHARED</h2>
+    <div class="wrap"><table>
+      <thead><tr><th></th><th>문제</th><th>상태</th><th>포트</th><th>참가자</th><th>컨테이너</th><th>생성</th><th>idle</th></tr></thead>
+      <tbody id="shared"></tbody>
+    </table></div>
+
+    <h2>PER_USER</h2>
+    <div class="wrap"><table>
+      <thead><tr><th>uuid</th><th>문제</th><th>상태</th><th>포트</th><th>컨테이너</th><th>생성</th></tr></thead>
+      <tbody id="perUser"></tbody>
+    </table></div>
+
+    <section id="orphanSection" hidden>
+      <h2>orphan (registry에 기록 없음)</h2>
+      <div class="wrap"><table>
+        <thead><tr><th>컨테이너</th><th>문제</th><th>uuid</th><th>상태</th><th>생성</th></tr></thead>
+        <tbody id="orphans"></tbody>
+      </table></div>
+    </section>
+  </div>
+</main>
+
+<script>
+"use strict";
+const POLL_MS = 5000;
+const open = new Set();   // 펼쳐 둔 SHARED 문제 코드
+let last = null;          // 마지막으로 받은 snapshot
+
+// 값은 전부 textContent로 넣는다. HTML로 해석되지 않게 하기 위해서다.
+function el(tag, attrs, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") e.className = v;
+    else if (k === "onclick") e.addEventListener("click", v);
+    else e.setAttribute(k, v);
+  }
+  for (const c of children) e.append(c instanceof Node ? c : document.createTextNode(c ?? ""));
+  return e;
+}
+const td = (...c) => el("td", {}, ...c);
+const mono = (t) => el("span", { class: "mono" }, t ?? "-");
+const badge = (s) => el("span", { class: "badge " + s }, s);
+
+function ago(iso) {
+  if (!iso) return "-";
+  const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return s + "초 전";
+  if (s < 3600) return Math.floor(s / 60) + "분 전";
+  if (s < 86400) return Math.floor(s / 3600) + "시간 전";
+  return Math.floor(s / 86400) + "일 전";
+}
+function until(iso) {
+  const s = Math.round((new Date(iso).getTime() - Date.now()) / 1000);
+  if (s <= 0) return "만료됨";
+  if (s < 60) return s + "초 남음";
+  if (s < 3600) return Math.floor(s / 60) + "분 남음";
+  return Math.floor(s / 3600) + "시간 " + Math.floor((s % 3600) / 60) + "분 남음";
+}
+const local = (iso) => iso ? new Date(iso).toLocaleString() : "-";
+
+function renderCards(sum) {
+  const items = [
+    ["containers", "컨테이너"], ["running", "running"], ["shared", "SHARED"],
+    ["perUser", "PER_USER"], ["leases", "lease"], ["orphans", "orphan"],
+  ];
+  document.getElementById("cards").replaceChildren(
+    ...items.map(([k, label]) => el("div", { class: "card" },
+      el("div", { class: "n" }, String(sum[k] ?? 0)), el("div", { class: "l" }, label)))
+  );
+}
+
+function renderShared(list) {
+  const body = document.getElementById("shared");
+  if (!list.length) { body.replaceChildren(el("tr", {}, el("td", { class: "empty", colspan: "8" }, "없음"))); return; }
+  const rows = [];
+  for (const s of list) {
+    const isOpen = open.has(s.challengeCode);
+    const live = s.leases.filter(l => !l.expired).length;
+    rows.push(el("tr", { class: "expandable", onclick: () => {
+        isOpen ? open.delete(s.challengeCode) : open.add(s.challengeCode); render(last);
+      } },
+      td(el("span", { class: "caret" }, isOpen ? "▾" : "▸")),
+      td(s.challengeCode), td(badge(s.state)), td(mono(s.hostPort ?? "-")),
+      td(live + (s.leases.length !== live ? ` (+만료 ${s.leases.length - live})` : "")),
+      td(mono(s.containerName || s.instanceId)), td(el("span", { title: local(s.createdAt) }, ago(s.createdAt))),
+      td(s.idleSince ? ago(s.idleSince) : "-")));
+    if (isOpen) {
+      const inner = s.leases.length
+        ? el("table", {},
+            el("thead", {}, el("tr", {}, el("th", {}, "uuid"), el("th", {}, "만료 시각"), el("th", {}, "남은 시간"))),
+            el("tbody", {}, ...s.leases.map(l => el("tr", {},
+              td(mono(l.uuid)), td(local(l.expiresAt)),
+              td(l.expired ? el("span", { class: "badge expired" }, "만료됨") : until(l.expiresAt))))))
+        : el("div", { class: "empty" }, "lease 없음");
+      rows.push(el("tr", { class: "leases" }, el("td", { colspan: "8" }, inner)));
+    }
+  }
+  body.replaceChildren(...rows);
+}
+
+function renderPerUser(list) {
+  const body = document.getElementById("perUser");
+  if (!list.length) { body.replaceChildren(el("tr", {}, el("td", { class: "empty", colspan: "6" }, "없음"))); return; }
+  body.replaceChildren(...list.map(p => el("tr", {},
+    td(mono(p.uuid)), td(p.challengeCode || "-"), td(badge(p.state)), td(mono(p.hostPort ?? "-")),
+    td(mono(p.containerName || p.instanceId)), td(el("span", { title: local(p.createdAt) }, ago(p.createdAt))))));
+}
+
+function renderOrphans(list) {
+  document.getElementById("orphanSection").hidden = !list.length;
+  document.getElementById("orphans").replaceChildren(...list.map(o => el("tr", {},
+    td(mono(o.containerName)), td(o.challengeCode || "-"), td(mono(o.uuid || "-")), td(badge(o.state)),
+    td(el("span", { title: local(o.createdAt) }, ago(o.createdAt))))));
+}
+
+function render(snap) {
+  if (!snap) return;
+  renderCards(snap.summary);
+  renderShared(snap.shared || []);
+  renderPerUser(snap.perUser || []);
+  renderOrphans(snap.orphans || []);
+  document.getElementById("updated").textContent = "agent 갱신: " + ago(snap.generatedAt);
+}
+
+function setBanner(msg) {
+  const b = document.getElementById("banner");
+  b.textContent = msg || "";
+  b.classList.toggle("show", !!msg);
+  document.getElementById("content").classList.toggle("stale", !!msg && !!last);
+}
+
+async function poll() {
+  try {
+    const res = await fetch("/api/instances", { cache: "no-store" });
+    if (res.ok) {
+      last = await res.json();
+      setBanner("");
+      render(last);
+    } else {
+      const body = await res.json().catch(() => ({}));
+      setBanner((res.status === 503 ? "agent 응답 없음: " : "오류: ") + (body.error || res.status));
+      if (!last) document.getElementById("updated").textContent = "데이터 없음";
+    }
+  } catch (e) {
+    setBanner("대시보드 서버에 연결할 수 없습니다 (SSH 터널을 확인하세요)");
+  }
+}
+
+poll();
+setInterval(poll, POLL_MS);
+// "N초 전" 표시만 1초마다 다시 계산한다.
+setInterval(() => { if (last) document.getElementById("updated").textContent = "agent 갱신: " + ago(last.generatedAt); }, 1000);
+</script>
+</body>
+</html>
