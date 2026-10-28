@@ -3,6 +3,8 @@ package handler
 import (
 	"strings"
 
+	protocol "nimda-ctf-protocol"
+
 	"nimda-judge-provisioner/internal/queue"
 )
 
@@ -26,20 +28,26 @@ type TaskMessage interface {
 	ID() string
 }
 
-// 인스턴스(컨테이너)가 필요한 문제 유형.
+// 인스턴스(컨테이너)가 필요한 문제 유형과, 그 유형이 참가자에게 어떻게 붙는지.
+// agent는 문제 유형을 몰라야 하므로(ADR-0020), 카테고리 → 접속 방식 변환은 여기서 한다.
+// 값이 HTTP면 웹 프록시로, TCP면 포트 풀로 붙는다.
 // todo 유형이 늘어나면 여기 추가. 웹 백엔드의 ChallengeCategory enum과 값을 맞춰야 한다.
-var instanceCategories = map[string]bool{
-	"WEB": true,
-	"PWN": true,
+var instanceCategories = map[string]protocol.AccessType{
+	"WEB": protocol.AccessHTTP,
+	"PWN": protocol.AccessTCP,
 }
 
 // 문제 유형을 보고 무슨 작업인지 정한다.
 // 대소문자와 공백은 무시한다.
 func classify(category string) TaskKind {
-	if instanceCategories[strings.ToUpper(strings.TrimSpace(category))] {
+	if _, ok := instanceCategories[normalizeCategory(category)]; ok {
 		return TaskCreateInstance
 	}
 	return TaskGetPresignedURL
+}
+
+func normalizeCategory(category string) string {
+	return strings.ToUpper(strings.TrimSpace(category))
 }
 
 // 스트림에서 올라온 요청을 작업 메시지로 옮긴다.
@@ -51,6 +59,7 @@ func newTaskMessage(msg *queue.Request) TaskMessage {
 			ChallengeCode:     msg.ChallengeCode,
 			ChallengeCategory: msg.ChallengeCategory,
 			IsolationType:     msg.IsolationType,
+			AccessType:        instanceCategories[normalizeCategory(msg.ChallengeCategory)],
 			FlagType:          msg.FlagType,
 		}
 	default:
@@ -68,6 +77,7 @@ type CreateInstanceMessage struct {
 	ChallengeCode     string
 	ChallengeCategory string
 	IsolationType     string
+	AccessType        protocol.AccessType // 카테고리에서 정해진 접속 방식. agent에 그대로 전달한다.
 	FlagType          string
 }
 
