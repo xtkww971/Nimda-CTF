@@ -30,6 +30,8 @@ services:
       - CTF_BUILD_WORK_DIR=/var/lib/ctf/build
       # 생성된 인스턴스를 어느 주소로 안내할지. 로컬에선 호스트 루프백.
       - CTF_INSTANCE_HOST=127.0.0.1
+      # web(HTTP) 인스턴스를 붙일 네트워크. 프록시가 같은 네트워크에서 컨테이너 이름으로 붙는다(#35).
+      - CTF_INSTANCE_NETWORK=ctf-instances
       - CTF_AGENT_REDIS_ADDR=ctf-redis:6379
       - CTF_QUEUE_AGENT_STREAM_KEY=ctf:agent:ops
       - CTF_QUEUE_AGENT_CONSUMER_GROUP=ctf-agents
@@ -103,4 +105,13 @@ networks:
   # 만들어 주지 않는다. 그래서 enable_icc=false 같은 옵션과 함께 docker network create로
   # 미리 만들고(docs/runbook), 여기서는 external로 "밖에서 만든다"만 표시한다.
   ctf-pwn:
+    external: true
+
+  # web(HTTP) 문제 인스턴스 전용 네트워크 (ADR-0017, #35).
+  # agent가 도커 소켓으로 만든 web 컨테이너를 CTF_INSTANCE_NETWORK 이름으로 여기에 붙인다.
+  # internal로 만들어 인스턴스가 인터넷으로 못 나가게 하고(reverse shell 차단), host 포트를
+  # 안 연다. 프록시(웹 백엔드)가 같은 네트워크에서 컨테이너 이름으로 붙는다.
+  # ctf-pwn과 같이 compose 서비스가 안 쓰므로 docker network create로 미리 만들고(docs/runbook)
+  # 여기서는 external로 "밖에서 만든다"만 표시한다.
+  ctf-instances:
     external: true
