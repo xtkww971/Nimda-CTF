@@ -44,14 +44,19 @@ type Options struct {
 }
 
 // 접속 방식에 따라 달라지는 실행 옵션. 부르는 쪽(handler)이 채워 넘긴다.
-// zero value면 지금까지의 HTTP(web) 동작과 같다 — loopback 임의 포트, 기본 네트워크.
 type RunSpec struct {
-	// host 포트를 열 IP. 비면 "127.0.0.1"(web). pwn은 "0.0.0.0"처럼 밖에서 닿는 IP.
+	// host 포트를 열 IP. 비면 "127.0.0.1". pwn은 "0.0.0.0"처럼 밖에서 닿는 IP.
+	// Publish=false(web)면 쓰지 않는다.
 	BindIP string
-	// 열 host 포트. 0이면 데몬이 고른다(web). pwn은 포트 풀에서 받은 값.
+	// 열 host 포트. 0이면 데몬이 고른다. pwn은 포트 풀에서 받은 값.
+	// Publish=false(web)면 쓰지 않는다.
 	HostPort int
-	// 붙일 네트워크. 비면 기본 bridge(web). pwn은 "ctf-pwn".
+	// 붙일 네트워크. 비면 기본 bridge. web은 "ctf-instances", pwn은 "ctf-pwn".
 	Network string
+	// host 포트를 밖에 여는지. pwn(TCP)은 true다.
+	// web(HTTP)은 false다. 이때 PortBindings를 안 걸고, Run이 돌려주는 포트는 host 포트가
+	// 아니라 컨테이너가 EXPOSE한 포트다. 프록시가 같은 네트워크에서 그 포트로 컨테이너 이름에 붙는다.
+	Publish bool
 }
 
 // 재시작 시 포트 풀을 다시 계산할 때 쓴다(이슈 #29의 InitPortPool).
@@ -120,14 +125,19 @@ func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map
 	// PER_USER만 삭제하고 SHARED의 경우 삭제하지 않는다.
 	_ = d.Remove(ctx, name)
 
-	// 접속 방식별 값. zero value면 지금까지의 web 동작이다.
-	bindIP := spec.BindIP
-	if bindIP == "" {
-		bindIP = "127.0.0.1"
-	}
-	binding := nat.PortBinding{HostIP: bindIP} // HostPort 빈 값이면 데몬이 고른다
-	if spec.HostPort != 0 {
-		binding.HostPort = strconv.Itoa(spec.HostPort)
+	// pwn(TCP)만 host 포트를 연다. web(HTTP)은 ctf-instances 안에서 컨테이너 이름으로
+	// 붙으므로(ADR-0017) host 포트를 열지 않는다.
+	var portBindings nat.PortMap
+	if spec.Publish {
+		bindIP := spec.BindIP
+		if bindIP == "" {
+			bindIP = "127.0.0.1"
+		}
+		binding := nat.PortBinding{HostIP: bindIP} // HostPort 빈 값이면 데몬이 고른다
+		if spec.HostPort != 0 {
+			binding.HostPort = strconv.Itoa(spec.HostPort)
+		}
+		portBindings = nat.PortMap{containerPort: []nat.PortBinding{binding}}
 	}
 
 	// TCP는 포트가 미리 정해져 있으므로, 재시작 때 풀 재계산이 읽을 수 있게 라벨에 박는다.
@@ -154,9 +164,8 @@ func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map
 		// 파일시스템을 읽기 전용으로 만든다. dd로 디스크를 채울 자리를 없앤다.
 		// 쓰기가 필요한 곳은 아래 tmpfs(/tmp) 하나뿐이다.
 		ReadonlyRootfs: true,
-		PortBindings: nat.PortMap{
-			containerPort: []nat.PortBinding{binding},
-		},
+		// web(Publish=false)은 nil이라 host 포트를 안 연다.
+		PortBindings: portBindings,
 	}
 	if d.opts.MemoryLimit != "" {
 		// CLI는 "256m" 같은 문자열을 받았지만 API는 바이트 수를 받는다.
@@ -198,7 +207,13 @@ func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map
 		return "", 0, fmt.Errorf("컨테이너 실행 실패: %w", err)
 	}
 
-	// 데몬이 고른 host 포트는 띄운 뒤에야 정해진다.
+	if !spec.Publish {
+		// web은 host 포트를 안 연다. 컨테이너가 EXPOSE한 포트를 그대로 돌려준다.
+		// 프록시가 같은 네트워크(ctf-instances)에서 컨테이너 이름:이 포트로 붙는다.
+		return instanceID, containerPort.Int(), nil
+	}
+
+	// pwn은 데몬이 연 host 포트를 돌려준다. 띄운 뒤에야 정해진다.
 	hostPort, err = d.publishedPort(ctx, instanceID, containerPort)
 	if err != nil {
 		_ = d.Remove(ctx, name)
@@ -207,26 +222,31 @@ func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map
 	return instanceID, hostPort, nil
 }
 
-// 컨테이너가 떠 있는지와 열린 host 포트.
-func (d *Docker) Running(ctx context.Context, nameOrID string) (running bool, hostPort int, err error) {
+// 컨테이너가 떠 있는지와 붙을 포트, 그리고 컨테이너 이름.
+//
+// 포트는 접속 방식에 따라 뜻이 다르다. pwn(TCP)은 host에 연 포트, web(HTTP)은 컨테이너가
+// EXPOSE한 포트다. host 바인딩이 있으면 그 host 포트를, 없으면 EXPOSE 포트를 돌려준다.
+// 이름은 web 재사용(Existing) 경로가 접속 host로 쓴다. web은 컨테이너 이름으로 붙기 때문이다.
+func (d *Docker) Running(ctx context.Context, nameOrID string) (running bool, port int, name string, err error) {
 	info, err := d.cli.ContainerInspect(ctx, nameOrID)
 	if err != nil {
 		// 컨테이너가 존재하지 않음. 조회 실패와 구분하지 않는다
-		return false, 0, nil
+		return false, 0, "", nil
 	}
 	if info.State == nil || !info.State.Running {
-		return false, 0, nil
+		return false, 0, "", nil
 	}
+	name = strings.TrimPrefix(info.Name, "/")
 
-	port, err := firstExposedPort(info.Config.ExposedPorts)
+	exposed, err := firstExposedPort(info.Config.ExposedPorts)
 	if err != nil {
-		return true, 0, nil // 떠 있지만 포트를 모른다
+		return true, 0, name, nil // 떠 있지만 포트를 모른다
 	}
-	hostPort, err = portFromBindings(info.NetworkSettings.Ports, port)
-	if err != nil {
-		return true, 0, nil
+	// host 바인딩이 있으면 host 포트(pwn), 없으면 EXPOSE 포트(web)를 돌려준다.
+	if hostPort, err := portFromBindings(info.NetworkSettings.Ports, exposed); err == nil {
+		return true, hostPort, name, nil
 	}
-	return true, hostPort, nil
+	return true, exposed.Int(), name, nil
 }
 
 // 모니터링에 쓰는 컨테이너 정보 (Feature-01).
