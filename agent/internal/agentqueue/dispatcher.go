@@ -22,8 +22,8 @@ type InstanceHandler interface {
 
 // uuid ↔ 컨테이너 기록. 구현은 registry 패키지(ADR-0019).
 type Registry interface {
-	// PER_USER
-	Save(ctx context.Context, uuid, instanceID string, port int) error
+	// PER_USER. expiresAt은 reaper가 만료를 집행하는 기준이다(ADR-0014).
+	Save(ctx context.Context, uuid, instanceID string, port int, expiresAt time.Time) error
 	InstanceID(ctx context.Context, uuid string) (string, error)
 	Delete(ctx context.Context, uuid string) error
 
@@ -166,7 +166,9 @@ func (d *Dispatcher) createPerUser(ctx context.Context, req *protocol.RequestMes
 
 	// 기록을 남긴다. 실패해도 인스턴스는 이미 떠 있으므로 응답은 그대로 보낸다 —
 	// 대신 다음 재배달 때 재사용을 못 하고 다시 만들게 된다.
-	if err := d.registry.Save(ctx, req.UUID, res.InstanceID, port); err != nil {
+	// 만료 시각은 handler가 정해 응답에 담았다. reaper가 이걸 기준으로 회수한다(ADR-0014).
+	expiresAt, _ := time.Parse(time.RFC3339, res.ExpiresAt) // 빈 값이면 zero
+	if err := d.registry.Save(ctx, req.UUID, res.InstanceID, port, expiresAt); err != nil {
 		d.log.ErrorContext(ctx, "인스턴스 기록 실패, 재배달 시 중복 생성될 수 있음",
 			"uuid", req.UUID, "instanceId", res.InstanceID, "error", err)
 	}
