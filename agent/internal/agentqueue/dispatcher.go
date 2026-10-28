@@ -27,6 +27,10 @@ type Registry interface {
 	InstanceID(ctx context.Context, uuid string) (string, error)
 	Delete(ctx context.Context, uuid string) error
 
+	// 포트 풀 (TCP/pwn). 구현은 registry 패키지(이슈 #29).
+	AllocatePort(ctx context.Context) (port int, ok bool, err error)
+	ReleasePort(ctx context.Context, port int) error
+
 	// uuid: 전체. DESTROY는 이걸로 PER_USER인지 SHARED인지 판단한다.
 	Entry(ctx context.Context, uuid string) (*registry.Entry, error)
 
@@ -119,41 +123,73 @@ func (d *Dispatcher) createPerUser(ctx context.Context, req *protocol.RequestMes
 	// Redis Stream은 at-least-once다 — 처리 중에 죽거나 ACK이 늦으면 같은 요청이 다시
 	// 배달된다. 그대로 다시 만들면 runtime.Run이 같은 이름의 컨테이너를 docker rm -f로
 	// 지우고 새로 띄우므로, 참가자가 풀고 있던 인스턴스가 초기화된다.
-	instanceID, err := d.registry.InstanceID(ctx, req.UUID)
+	entry, err := d.registry.Entry(ctx, req.UUID)
 	if err != nil {
-		// 컨테이너 id를 읽지 못한 경우
+		// 기록을 읽지 못한 경우
 		return nil, err
 	}
-	if instanceID != "" {
-		if res := d.instances.Existing(ctx, req.UUID, instanceID, req.AccessType); res != nil {
-			// 인스턴스가 존재하는 경우
+	if entry != nil && entry.InstanceID != "" {
+		if res := d.instances.Existing(ctx, req.UUID, entry.InstanceID, req.AccessType); res != nil {
+			// 인스턴스가 이미 떠 있으면 그대로 돌려준다. TCP도 기존 포트를 재할당하지 않는다.
 			d.cleanupBuildDir(ctx, req)
 			return res, nil
 		}
-		// redis에는 인스턴스가 있지만 실제로 없는 경우
-		// todo TTL이 지나서 없어지는 경우에 인스턴스도 같이 정보 동기화를 해야 함
+		// redis에는 기록이 있는데 컨테이너가 없는 경우. 다시 만든다.
+		// TCP면 기록된 옛 포트를 먼저 반납한다. 안 하면 그 포트가 풀에서 영영 사라진다.
+		d.releaseIfTCP(ctx, req.AccessType, entry.Port)
 		d.log.WarnContext(ctx, "기록된 인스턴스가 살아있지 않음, 다시 만듭니다",
-			"uuid", req.UUID, "instanceId", instanceID)
+			"uuid", req.UUID, "instanceId", entry.InstanceID)
 	}
 
-	// TODO(이슈 B 3단계): TCP면 여기서 포트를 할당해 넘긴다. 지금은 0(HTTP).
-	res := d.instances.Create(ctx, req, 0)
+	// TCP면 포트 풀에서 포트를 받는다. HTTP면 port=0(데몬이 고름).
+	port, ok, err := d.allocatePort(ctx, req.AccessType)
+	if err != nil {
+		d.cleanupBuildDir(ctx, req)
+		return nil, err
+	}
+	if !ok {
+		d.cleanupBuildDir(ctx, req)
+		d.log.WarnContext(ctx, "포트 풀이 비어 인스턴스를 만들지 못함", "uuid", req.UUID)
+		return failed(req.UUID, protocol.ActionCreate, "지금 생성할 수 있는 인스턴스가 없습니다. 잠시 후 다시 시도해 주세요"), nil
+	}
+
+	res := d.instances.Create(ctx, req, port)
 
 	// 빌드가 끝난 이후 폴더 삭제
 	d.cleanupBuildDir(ctx, req)
 
 	if res.Status != protocol.StatusReady {
+		// 컨테이너가 안 떴으면 받은 포트를 풀에 되돌린다.
+		d.releaseIfTCP(ctx, req.AccessType, port)
 		return res, nil
 	}
 
 	// 기록을 남긴다. 실패해도 인스턴스는 이미 떠 있으므로 응답은 그대로 보낸다 —
 	// 대신 다음 재배달 때 재사용을 못 하고 다시 만들게 된다.
-	// port는 0으로 둔다. TCP(pwn)일 때 포트를 받아 넘기는 건 다음 이슈에서 한다.
-	if err := d.registry.Save(ctx, req.UUID, res.InstanceID, 0); err != nil {
+	if err := d.registry.Save(ctx, req.UUID, res.InstanceID, port); err != nil {
 		d.log.ErrorContext(ctx, "인스턴스 기록 실패, 재배달 시 중복 생성될 수 있음",
 			"uuid", req.UUID, "instanceId", res.InstanceID, "error", err)
 	}
 	return res, nil
+}
+
+// TCP면 포트 풀에서 포트를 꺼낸다. HTTP면 (0, true, nil) — 데몬이 고르므로 풀을 안 쓴다.
+func (d *Dispatcher) allocatePort(ctx context.Context, access protocol.AccessType) (port int, ok bool, err error) {
+	if access != protocol.AccessTCP {
+		return 0, true, nil
+	}
+	return d.registry.AllocatePort(ctx)
+}
+
+// TCP 포트를 풀에 되돌린다. HTTP(port 0)면 아무것도 안 한다. 반납 실패는 로그만 남긴다 —
+// 시작 시 재계산이 결국 바로잡기 때문이다(이슈 #29의 InitPortPool).
+func (d *Dispatcher) releaseIfTCP(ctx context.Context, access protocol.AccessType, port int) {
+	if access != protocol.AccessTCP || port == 0 {
+		return
+	}
+	if err := d.registry.ReleasePort(ctx, port); err != nil {
+		d.log.ErrorContext(ctx, "포트 반납 실패", "port", port, "error", err)
+	}
 }
 
 // 문제당 컨테이너 하나를 같이 쓴다(ADR-0019).
@@ -282,6 +318,13 @@ func (d *Dispatcher) destroy(ctx context.Context, req *protocol.RequestMessage) 
 	if res.Status == protocol.StatusDestroyed {
 		if err := d.registry.Delete(ctx, req.UUID); err != nil {
 			d.log.ErrorContext(ctx, "인스턴스 기록 삭제 실패", "uuid", req.UUID, "error", err)
+		}
+		// TCP 포트를 풀에 되돌린다. 컨테이너를 실제로 지운 뒤에만 반납한다 — 삭제가 실패했는데
+		// 포트만 돌아가면 다음 사람이 그 포트에 붙었다 죽은 컨테이너를 보게 된다.
+		if entry != nil && entry.Port != 0 {
+			if err := d.registry.ReleasePort(ctx, entry.Port); err != nil {
+				d.log.ErrorContext(ctx, "포트 반납 실패", "uuid", req.UUID, "port", entry.Port, "error", err)
+			}
 		}
 	}
 	return res, nil
