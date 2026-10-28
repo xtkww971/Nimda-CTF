@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -34,11 +35,17 @@ func main() {
 	// 조율자와 공유하는 빌드 폴더 루트. 이 아래 경로만 빌드 컨텍스트로 허용한다.
 	buildRoot := getenv("CTF_BUILD_WORK_DIR", "/var/lib/ctf/build")
 
-	// pwn(TCP) 전용 설정. 포트 풀 범위·초기화는 4단계에서 붙인다.
+	// pwn(TCP) 전용 설정.
 	pwn := agentserver.PwnOptions{
 		Host:    os.Getenv("CTF_PWN_PUBLIC_HOST"), // TCP를 쓸 거면 필수. 참가자에게 보여줄 주소
 		BindIP:  getenv("CTF_PWN_BIND_IP", "0.0.0.0"),
 		Network: getenv("CTF_PWN_NETWORK", "ctf-pwn"),
+	}
+	// 포트 풀 범위. 밖에 열 포트는 여기서만 나눠준다(ADR-0013).
+	portLo, portHi, err := parsePortRange(getenv("CTF_PWN_PORT_RANGE", "30000-30199"))
+	if err != nil {
+		logger.Error("CTF_PWN_PORT_RANGE 해석 실패", "error", err)
+		os.Exit(1)
 	}
 
 	// 도커 데몬 소켓에 붙는다. 여기서 실패하면 이 프로세스가 할 수 있는 일이 없다.
@@ -82,6 +89,20 @@ func main() {
 	}
 
 	reg := registry.New(rdb)
+
+	// 포트 풀을 다시 계산한다. 요청을 받기 전에, 지금 떠 있는 컨테이너가 쓰는 포트를 빼고 채운다.
+	// 반납 못 하고 죽은 포트는 여기서 돌아오고, 이미 쓰는 포트는 다시 안 나간다(이슈 #29).
+	used, err := rt.UsedPorts(ctx)
+	if err != nil {
+		logger.Error("사용 중인 포트 조회 실패", "error", err)
+		os.Exit(1)
+	}
+	if err := reg.InitPortPool(ctx, portLo, portHi, used); err != nil {
+		logger.Error("포트 풀 초기화 실패", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("포트 풀 초기화 완료", "range", fmt.Sprintf("%d-%d", portLo, portHi), "used", len(used))
+
 	dispatcher := agentqueue.NewDispatcher(instances, reg, logger)
 	consumer := agentqueue.NewConsumer(rdb, opts, dispatcher, logger)
 	if err := consumer.EnsureGroup(ctx); err != nil {
@@ -143,6 +164,26 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// "30000-30199" 같은 범위를 lo, hi로 푼다. lo > hi거나 형식이 틀리면 에러다.
+func parsePortRange(s string) (lo, hi int, err error) {
+	loStr, hiStr, ok := strings.Cut(s, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("형식은 \"lo-hi\"여야 합니다: %q", s)
+	}
+	lo, err = strconv.Atoi(strings.TrimSpace(loStr))
+	if err != nil {
+		return 0, 0, fmt.Errorf("시작 포트 해석 실패 (%q): %w", loStr, err)
+	}
+	hi, err = strconv.Atoi(strings.TrimSpace(hiStr))
+	if err != nil {
+		return 0, 0, fmt.Errorf("끝 포트 해석 실패 (%q): %w", hiStr, err)
+	}
+	if lo < 1 || hi > 65535 || lo > hi {
+		return 0, 0, fmt.Errorf("포트 범위가 잘못됐습니다: %d-%d", lo, hi)
+	}
+	return lo, hi, nil
 }
 
 func getenvInt(key string, fallback int) int {
