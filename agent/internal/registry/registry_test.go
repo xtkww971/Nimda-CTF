@@ -42,7 +42,7 @@ func TestPerUserSaveAndLookup(t *testing.T) {
 	uuid := unique("u")
 	cleanup(t, rdb, key(uuid))
 
-	if err := r.Save(ctx, uuid, "container-1"); err != nil {
+	if err := r.Save(ctx, uuid, "container-1", 0); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	id, err := r.InstanceID(ctx, uuid)
@@ -266,7 +266,7 @@ func TestAllEntriesSharedAndLeases(t *testing.T) {
 	code, p, s := unique("web"), unique("p"), unique("s")
 	cleanup(t, rdb, key(p), key(s), sharedKey(code), leasesKey(code))
 
-	r.Save(ctx, p, "per-user-container")
+	r.Save(ctx, p, "per-user-container", 0)
 	r.SaveShared(ctx, code, "shared-container")
 	exp := time.Now().Add(time.Hour).Truncate(time.Second).UTC()
 	r.Join(ctx, code, s, exp)
@@ -296,5 +296,120 @@ func TestAllEntriesSharedAndLeases(t *testing.T) {
 	leases, err := r.Leases(ctx, code)
 	if err != nil || len(leases) != 1 || leases[0].UUID != s || !leases[0].ExpiresAt.Equal(exp) {
 		t.Errorf("Leases = %+v, %v", leases, err)
+	}
+}
+
+// ── 포트 풀 (ADR-0020) ───────────────────────────────────────────────────────
+
+// InitPortPool은 떠 있는 포트를 뺀 나머지로 풀을 채운다.
+func TestInitPortPoolExcludesUsed(t *testing.T) {
+	r, rdb := newTestRegistry(t)
+	ctx := context.Background()
+	cleanup(t, rdb, PortsFreeKey)
+
+	if err := r.InitPortPool(ctx, 30000, 30002, []int{30001}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	got, err := rdb.SMembers(ctx, PortsFreeKey).Result()
+	if err != nil {
+		t.Fatalf("smembers: %v", err)
+	}
+	want := map[string]bool{"30000": true, "30002": true}
+	if len(got) != len(want) {
+		t.Fatalf("free = %v, want %v", got, want)
+	}
+	for _, p := range got {
+		if !want[p] {
+			t.Errorf("free에 없어야 할 포트: %q", p)
+		}
+	}
+}
+
+// 풀 크기만큼 꺼내면 서로 다른 포트가 나오고, 그 다음엔 ok=false다.
+func TestAllocatePortExhausts(t *testing.T) {
+	r, rdb := newTestRegistry(t)
+	ctx := context.Background()
+	cleanup(t, rdb, PortsFreeKey)
+
+	if err := r.InitPortPool(ctx, 30000, 30002, nil); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	seen := map[int]bool{}
+	for i := 0; i < 3; i++ {
+		p, ok, err := r.AllocatePort(ctx)
+		if err != nil || !ok {
+			t.Fatalf("allocate %d: ok=%v err=%v", i, ok, err)
+		}
+		if p < 30000 || p > 30002 {
+			t.Errorf("할당 포트가 범위 밖: %d", p)
+		}
+		if seen[p] {
+			t.Errorf("같은 포트를 두 번 할당: %d", p)
+		}
+		seen[p] = true
+	}
+
+	if _, ok, err := r.AllocatePort(ctx); ok || err != nil {
+		t.Errorf("빈 풀에서 ok=%v err=%v, want ok=false", ok, err)
+	}
+}
+
+// 반납한 포트는 다시 할당된다. 두 번 반납해도 풀엔 하나만 생긴다.
+func TestReleasePortReturnsToPool(t *testing.T) {
+	r, rdb := newTestRegistry(t)
+	ctx := context.Background()
+	cleanup(t, rdb, PortsFreeKey)
+
+	if err := r.InitPortPool(ctx, 30000, 30000, nil); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	p, ok, err := r.AllocatePort(ctx)
+	if err != nil || !ok || p != 30000 {
+		t.Fatalf("allocate: p=%d ok=%v err=%v", p, ok, err)
+	}
+
+	// 같은 포트를 두 번 반납해도 중복이 생기면 안 된다.
+	if err := r.ReleasePort(ctx, 30000); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if err := r.ReleasePort(ctx, 30000); err != nil {
+		t.Fatalf("release 2: %v", err)
+	}
+	if n := rdb.SCard(ctx, PortsFreeKey).Val(); n != 1 {
+		t.Fatalf("반납 후 풀 크기 = %d, want 1", n)
+	}
+
+	p2, ok, err := r.AllocatePort(ctx)
+	if err != nil || !ok || p2 != 30000 {
+		t.Fatalf("반납한 포트가 다시 안 나옴: p=%d ok=%v err=%v", p2, ok, err)
+	}
+}
+
+// TCP 인스턴스는 port를 저장하고, Entry로 되읽는다. port 0이면 필드 자체가 없다.
+func TestSaveStoresPort(t *testing.T) {
+	r, rdb := newTestRegistry(t)
+	ctx := context.Background()
+	withPort, noPort := unique("u-tcp"), unique("u-http")
+	cleanup(t, rdb, key(withPort), key(noPort))
+
+	if err := r.Save(ctx, withPort, "c-tcp", 30042); err != nil {
+		t.Fatalf("save with port: %v", err)
+	}
+	e, err := r.Entry(ctx, withPort)
+	if err != nil || e == nil || e.Port != 30042 {
+		t.Fatalf("Entry.Port = %v (err=%v), want 30042", e, err)
+	}
+
+	if err := r.Save(ctx, noPort, "c-http", 0); err != nil {
+		t.Fatalf("save no port: %v", err)
+	}
+	if ok := rdb.HExists(ctx, key(noPort), fieldPort).Val(); ok {
+		t.Error("port 0인데 hash에 port 필드가 저장됨")
+	}
+	e2, err := r.Entry(ctx, noPort)
+	if err != nil || e2 == nil || e2.Port != 0 {
+		t.Fatalf("Entry.Port = %v (err=%v), want 0", e2, err)
 	}
 }

@@ -67,8 +67,9 @@ func newFakeRegistry() *fakeRegistry {
 	}
 }
 
-func (r *fakeRegistry) Save(_ context.Context, uuid, instanceID string) error {
+func (r *fakeRegistry) Save(_ context.Context, uuid, instanceID string, port int) error {
 	r.saved[uuid] = instanceID
+	_ = port // 포트를 받아 넘기는 분기는 다음 이슈. 지금은 0만 온다.
 	return nil
 }
 
