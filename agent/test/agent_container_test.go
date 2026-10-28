@@ -46,7 +46,7 @@ func TestAgentBuildsRunsAndIsReachable(t *testing.T) {
 
 	// 조율자가 압축을 푸는 공유 폴더 역할. Agent는 이 루트 아래 경로만 빌드한다.
 	buildRoot := t.TempDir()
-	handler := agentserver.NewDockerHandler(rt, "127.0.0.1", buildRoot, logger)
+	handler := agentserver.NewDockerHandler(rt, "127.0.0.1", buildRoot, agentserver.PwnOptions{}, logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -72,7 +72,7 @@ func TestAgentBuildsRunsAndIsReachable(t *testing.T) {
 		IsolationType:    "PER_USER",
 		FlagType:         "STATIC",
 		BuildContextPath: buildDir,
-	})
+	}, 0)
 
 	if res == nil {
 		t.Fatal("create가 결과를 반환하지 않음")
@@ -123,7 +123,7 @@ func TestAgentRejectsBuildPathOutsideRoot(t *testing.T) {
 		t.Skipf("도커 데몬에 연결하지 못해 건너뜁니다: %v", err)
 	}
 	defer rt.Close()
-	handler := agentserver.NewDockerHandler(rt, "127.0.0.1", t.TempDir(), logger)
+	handler := agentserver.NewDockerHandler(rt, "127.0.0.1", t.TempDir(), agentserver.PwnOptions{}, logger)
 
 	res := handler.Create(context.Background(), &protocol.RequestMessage{
 		UUID:             "uuid-escape-1",
@@ -132,7 +132,7 @@ func TestAgentRejectsBuildPathOutsideRoot(t *testing.T) {
 		IsolationType:    "PER_USER",
 		FlagType:         "STATIC",
 		BuildContextPath: filepath.Join(t.TempDir(), "elsewhere"),
-	})
+	}, 0)
 
 	if res.Status != protocol.StatusFailed {
 		t.Fatalf("허용 루트 밖 경로를 받아들임: %+v", res)

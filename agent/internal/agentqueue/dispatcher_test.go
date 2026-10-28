@@ -18,12 +18,14 @@ import (
 type fakeInstances struct {
 	createCalls  int
 	destroyCalls int
+	lastPort     int // Create에 넘어온 hostPort (TCP 분기 검증용)
 	existing     *protocol.ResponseMessage // Existing이 돌려줄 값
 	createResult *protocol.ResponseMessage
 }
 
-func (f *fakeInstances) Create(_ context.Context, req *protocol.RequestMessage) *protocol.ResponseMessage {
+func (f *fakeInstances) Create(_ context.Context, req *protocol.RequestMessage, hostPort int) *protocol.ResponseMessage {
 	f.createCalls++
+	f.lastPort = hostPort
 	if f.createResult != nil {
 		return f.createResult
 	}
@@ -41,7 +43,7 @@ func (f *fakeInstances) Destroy(_ context.Context, uuid, instanceID string) *pro
 	return &protocol.ResponseMessage{UUID: uuid, Action: protocol.ActionDestroy, Status: protocol.StatusDestroyed}
 }
 
-func (f *fakeInstances) Existing(_ context.Context, _, _ string) *protocol.ResponseMessage {
+func (f *fakeInstances) Existing(_ context.Context, _, _ string, _ protocol.AccessType) *protocol.ResponseMessage {
 	return f.existing
 }
 
