@@ -16,10 +16,18 @@ import (
 // TODO TTL 설정 아직 안함
 const perUserTTL = time.Hour
 
+// pwn(TCP) 인스턴스에만 쓰는 설정. web(HTTP)은 쓰지 않는다.
+type PwnOptions struct {
+	Host    string // 참가자에게 보여줄 pwn 접속 주소 (CTF_PWN_PUBLIC_HOST)
+	BindIP  string // 포트를 열 host IP (CTF_PWN_BIND_IP)
+	Network string // 컨테이너를 붙일 네트워크 (CTF_PWN_NETWORK)
+}
+
 type DockerHandler struct {
 	rt   *runtime.Docker
 	log  *slog.Logger
-	host string // 참가자가 접속하는 주소 (예: "chal.nimda.kr")
+	host string      // web 참가자가 접속하는 주소 (예: "chal.nimda.kr")
+	pwn  PwnOptions  // pwn(TCP) 전용 설정
 
 	// buildRoot는 빌드 컨텍스트 경로가 반드시 그 아래여야 하는 허용 루트다. Provisioner가
 	// 넘긴 경로를 그대로 믿으면 임의 호스트 경로(예: /)를 빌드 컨텍스트로 삼을 수 있으므로,
@@ -27,11 +35,22 @@ type DockerHandler struct {
 	buildRoot string
 }
 
-func NewDockerHandler(rt *runtime.Docker, host, buildRoot string, log *slog.Logger) *DockerHandler {
-	return &DockerHandler{rt: rt, host: host, buildRoot: buildRoot, log: log}
+func NewDockerHandler(rt *runtime.Docker, host, buildRoot string, pwn PwnOptions, log *slog.Logger) *DockerHandler {
+	return &DockerHandler{rt: rt, host: host, buildRoot: buildRoot, pwn: pwn, log: log}
 }
 
-func (h *DockerHandler) Create(ctx context.Context, req *protocol.RequestMessage) *protocol.ResponseMessage {
+// 접속 방식에 따라 실행 옵션과 참가자에게 보여줄 host를 정한다.
+// TCP(pwn)는 할당받은 포트를 지정 IP·ctf-pwn 네트워크로 열고 pwn 주소를 보여준다.
+// HTTP(web)는 zero value spec(loopback 임의 포트, 기본 네트워크)과 web 주소를 쓴다.
+func (h *DockerHandler) runParams(access protocol.AccessType, hostPort int) (runtime.RunSpec, string) {
+	if access == protocol.AccessTCP {
+		return runtime.RunSpec{BindIP: h.pwn.BindIP, HostPort: hostPort, Network: h.pwn.Network}, h.pwn.Host
+	}
+	return runtime.RunSpec{}, h.host
+}
+
+// hostPort는 TCP일 때 dispatcher가 포트 풀에서 받아 넘긴 포트다. HTTP면 0이고 데몬이 고른다.
+func (h *DockerHandler) Create(ctx context.Context, req *protocol.RequestMessage, hostPort int) *protocol.ResponseMessage {
 	code := sanitize(req.ChallengeCode)
 	if code == "" {
 		return failed(req.UUID, "challengeCode가 비어있거나 허용되지 않는 문자만 있습니다")
@@ -64,8 +83,8 @@ func (h *DockerHandler) Create(ctx context.Context, req *protocol.RequestMessage
 		"nimda.ctf.uuid": req.UUID,
 	}
 
-	// TODO(이슈 B 2단계): TCP면 할당 포트·바인딩 IP·ctf-pwn 네트워크로 채운다. 지금은 web과 동일.
-	instanceID, port, err := h.rt.Run(ctx, image, name, env, labels, runtime.RunSpec{})
+	spec, host := h.runParams(req.AccessType, hostPort)
+	instanceID, port, err := h.rt.Run(ctx, image, name, env, labels, spec)
 	if err != nil {
 		return failed(req.UUID, "컨테이너 실행 실패: "+err.Error())
 	}
@@ -75,7 +94,7 @@ func (h *DockerHandler) Create(ctx context.Context, req *protocol.RequestMessage
 		Action:     protocol.ActionCreate,
 		Status:     protocol.StatusReady,
 		InstanceID: instanceID,
-		Host:       h.host,
+		Host:       host,
 		Port:       port,
 	}
 	if req.IsolationType == "PER_USER" {
@@ -153,17 +172,22 @@ func failed(uuid, msg string) *protocol.ResponseMessage {
 }
 
 // 이미 떠 있는 인스턴스를 그대로 돌려준다. 재배달이나 중복 요청일 때 쓴다.
-func (h *DockerHandler) Existing(ctx context.Context, uuid, instanceID string) *protocol.ResponseMessage {
+func (h *DockerHandler) Existing(ctx context.Context, uuid, instanceID string, access protocol.AccessType) *protocol.ResponseMessage {
 	running, port, err := h.rt.Running(ctx, instanceID)
 	if err != nil || !running {
 		return nil
+	}
+	// 이미 떠 있는 컨테이너의 포트를 그대로 쓴다. 보여줄 host만 접속 방식에 따라 고른다.
+	host := h.host
+	if access == protocol.AccessTCP {
+		host = h.pwn.Host
 	}
 	res := &protocol.ResponseMessage{
 		UUID:       uuid,
 		Action:     protocol.ActionCreate,
 		Status:     protocol.StatusReady,
 		InstanceID: instanceID,
-		Host:       h.host,
+		Host:       host,
 		Port:       port,
 	}
 	h.log.Info("이미 떠 있는 인스턴스를 재사용", "uuid", uuid, "instanceId", instanceID, "port", port)
