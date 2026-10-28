@@ -21,6 +21,9 @@ func (r RequestMessage) ToStreamValues() map[string]interface{} {
 	if r.IsolationType != "" {
 		values["isolationType"] = string(r.IsolationType)
 	}
+	if r.AccessType != "" {
+		values["accessType"] = string(r.AccessType)
+	}
 	if r.FlagType != "" {
 		values["flagType"] = r.FlagType
 	}
@@ -49,6 +52,7 @@ func ParseRequestMessage(values map[string]interface{}) (*RequestMessage, error)
 		Action:           action,
 		ChallengeCode:    optionalString(values, "challengeCode"),
 		IsolationType:    IsolationType(optionalString(values, "isolationType")),
+		AccessType:       AccessType(optionalString(values, "accessType")),
 		FlagType:         optionalString(values, "flagType"),
 		Flag:             optionalString(values, "flag"),
 		BuildContextPath: optionalString(values, "buildContextPath"),
@@ -59,6 +63,7 @@ func ParseRequestMessage(values map[string]interface{}) (*RequestMessage, error)
 		for _, f := range []struct{ name, value string }{
 			{"challengeCode", req.ChallengeCode},
 			{"isolationType", string(req.IsolationType)},
+			{"accessType", string(req.AccessType)},
 			{"flagType", req.FlagType},
 			{"buildContextPath", req.BuildContextPath},
 		} {
@@ -70,8 +75,15 @@ func ParseRequestMessage(values map[string]interface{}) (*RequestMessage, error)
 		if !req.IsolationType.Valid() {
 			return nil, fmt.Errorf("field %q has unknown value %q", "isolationType", req.IsolationType)
 		}
+		if !req.AccessType.Valid() {
+			return nil, fmt.Errorf("field %q has unknown value %q", "accessType", req.AccessType)
+		}
 		if req.IsolationType == IsolationShared && req.FlagType == FlagDynamic {
 			return nil, fmt.Errorf("isolationType %q cannot use flagType %q", IsolationShared, FlagDynamic)
+		}
+		// pwn(TCP)은 포트를 밖에 연다. SHARED로 뜨면 한 명이 셸을 따서 모두의 문제를 망친다.
+		if req.AccessType == AccessTCP && req.IsolationType == IsolationShared {
+			return nil, fmt.Errorf("accessType %q cannot use isolationType %q", AccessTCP, IsolationShared)
 		}
 	case ActionDestroy:
 		// 어느 컨테이너인지는 에이전트가 uuid로 찾는다.

@@ -18,6 +18,20 @@ func (t IsolationType) Valid() bool {
 	return t == IsolationShared || t == IsolationPerUser
 }
 
+// 참가자가 인스턴스에 어떻게 붙는지. agent는 문제 유형(category)을 모르고 이 값만 본다.
+// 이 값에 따라 붙이는 네트워크와 포트를 밖에 여는지가 갈린다(ADR-0020).
+type AccessType string
+
+const (
+	AccessHTTP AccessType = "HTTP" // 웹 프록시를 거친다. 포트를 밖에 열지 않는다
+	AccessTCP  AccessType = "TCP"  // 포트 풀에서 포트를 받아 밖에 연다 (pwn)
+)
+
+// 모르는 값을 TCP로 흘려보내면 의도치 않게 포트가 밖에 열린다.
+func (t AccessType) Valid() bool {
+	return t == AccessHTTP || t == AccessTCP
+}
+
 const (
 	FlagStatic  = "STATIC"
 	FlagDynamic = "DYNAMIC"
@@ -31,6 +45,7 @@ type RequestMessage struct {
 	// CREATE
 	ChallengeCode string `json:"challengeCode,omitempty"`
 	IsolationType IsolationType `json:"isolationType,omitempty"`
+	AccessType    AccessType    `json:"accessType,omitempty"` // AccessHTTP | AccessTCP
 	FlagType      string        `json:"flagType,omitempty"` // FlagStatic | FlagDynamic
 	Flag          string `json:"flag,omitempty"`
 

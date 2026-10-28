@@ -11,6 +11,7 @@ func createRequest() RequestMessage {
 		Action:           ActionCreate,
 		ChallengeCode:    "web-basic-01",
 		IsolationType:    "PER_USER",
+		AccessType:       AccessHTTP,
 		FlagType:         "DYNAMIC",
 		Flag:             "FLAG{abc}",
 		BuildContextPath: "/var/lib/ctf/build/9f1c-req-1",
@@ -53,7 +54,7 @@ func TestCreateRequestOmitsEmptyFlag(t *testing.T) {
 func TestCreateRequestRejectsMissingFields(t *testing.T) {
 	base := createRequest().ToStreamValues()
 
-	for _, key := range []string{"uuid", "action", "challengeCode", "isolationType", "flagType", "buildContextPath"} {
+	for _, key := range []string{"uuid", "action", "challengeCode", "isolationType", "accessType", "flagType", "buildContextPath"} {
 		values := map[string]interface{}{}
 		for k, v := range base {
 			values[k] = v
@@ -126,6 +127,47 @@ func TestCreateRequestRejectsSharedDynamic(t *testing.T) {
 
 	if _, err := ParseRequestMessage(in.ToStreamValues()); err == nil {
 		t.Error("SHARED + DYNAMIC인데 파싱이 성공했습니다")
+	}
+}
+
+// pwn은 TCP + PER_USER로 온다. 값만 달라지고 한 바퀴 돌려도 그대로여야 한다.
+func TestCreateRequestTCPRoundTrip(t *testing.T) {
+	in := createRequest()
+	in.AccessType = AccessTCP
+	in.FlagType = FlagStatic
+	in.Flag = ""
+
+	out, err := ParseRequestMessage(in.ToStreamValues())
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if *out != in {
+		t.Errorf("round trip changed the request:\n got %+v\nwant %+v", *out, in)
+	}
+}
+
+// 모르는 접속 방식은 흘려보내지 않는다. 오타가 TCP로 처리되면 web 문제 포트가 밖에 열린다.
+func TestCreateRequestRejectsUnknownAccess(t *testing.T) {
+	for _, v := range []string{"http", "tcp", "RAW", "WS"} {
+		values := createRequest().ToStreamValues()
+		values["accessType"] = v
+
+		if _, err := ParseRequestMessage(values); err == nil {
+			t.Errorf("accessType=%q인데 파싱이 성공했습니다", v)
+		}
+	}
+}
+
+// pwn은 셸을 따는 게 정답이라 포트를 밖에 연다. SHARED로 뜨면 한 명이 모두의 문제를 망친다.
+func TestCreateRequestRejectsTCPShared(t *testing.T) {
+	in := createRequest()
+	in.AccessType = AccessTCP
+	in.IsolationType = IsolationShared
+	in.FlagType = FlagStatic
+	in.Flag = ""
+
+	if _, err := ParseRequestMessage(in.ToStreamValues()); err == nil {
+		t.Error("TCP + SHARED인데 파싱이 성공했습니다")
 	}
 }
 
