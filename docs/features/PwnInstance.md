@@ -97,12 +97,20 @@ EXPOSE 31337
 ENTRYPOINT ["/entrypoint.sh"]
 ```
 
+**출제 규칙: 런타임에 쓰는 파일은 `/tmp` 아래에 둔다.**
+agent는 컨테이너 rootfs를 읽기 전용으로 띄우고 `/tmp`만 크기 제한 tmpfs로 연다(#32).
+`dd`로 디스크를 채우는 걸 막기 위해서다.
+그래서 빌드 때 굽는 파일(STATIC flag, 바이너리)은 아무 데나 둬도 되지만,
+런타임에 만드는 파일(DYNAMIC flag, 로그, 임시 파일)은 `/tmp`에 써야 한다.
+`USER ctf`, setuid 금지, `EXPOSE` 하나도 같이 지킨다(ADR-0020).
+
 ```sh
 #!/bin/sh
 # entrypoint.sh
 # DYNAMIC이면 agent가 env FLAG로 넣어준다. 파일로 옮기고 env에서 지운다.
+# rootfs가 읽기 전용이라 쓸 수 있는 곳은 /tmp뿐이다(#32). 그래서 /tmp/flag에 쓴다.
 if [ -n "$FLAG" ]; then
-    echo "$FLAG" > /home/ctf/flag
+    echo "$FLAG" > /tmp/flag
 fi
 unset FLAG
 
@@ -110,7 +118,7 @@ unset FLAG
 exec socat TCP-LISTEN:31337,reuseaddr,fork EXEC:/chall/chall,stderr
 ```
 
-STATIC이면 `/chall/flag`를 읽게 하고, DYNAMIC이면 `/home/ctf/flag`를 읽게 문제 설명에 적는다.
+STATIC이면 `/chall/flag`를 읽게 하고, DYNAMIC이면 `/tmp/flag`를 읽게 문제 설명에 적는다.
 
 **3) 압축해서 등록한다**
 
@@ -225,7 +233,7 @@ socat은 살아 있어서 A가 다시 접속하면 새 `chall`이 뜬다.
 **셸을 딴 A가 플래그를 지웠다**
 
 `/chall/flag`는 root 소유 444라서 ctf 사용자는 못 지운다.
-DYNAMIC이라 `/home/ctf/flag`를 쓰는 문제면 지울 수 있다.
+DYNAMIC이라 `/tmp/flag`를 쓰는 문제면 지울 수 있다.
 그래도 PER_USER라서 망가지는 건 A 자신의 인스턴스뿐이다.
 A가 인스턴스를 다시 만들면 된다.
 
