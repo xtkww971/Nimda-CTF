@@ -236,6 +236,42 @@ func (r *Registry) LeaseCount(ctx context.Context, code string) (int64, error) {
 	return n, nil
 }
 
+// 만료된 lease(score ≤ now)를 집합에서 빼고, 그 참가자들의 uuid: 기록도 지운다.
+// 지운 uuid 목록을 돌려준다(로그용). reaper ①단계(ADR-0019): 참가자의 접근 종료.
+// lock 없이 해도 된다. 지우는 게 이미 만료된 참가 기록이라 CREATE와 겹치지 않는다.
+func (r *Registry) PruneExpiredLeases(ctx context.Context, code string, now time.Time) ([]string, error) {
+	max := strconv.FormatInt(now.Unix(), 10)
+	expired, err := r.rdb.ZRangeByScore(ctx, leasesKey(code), &redis.ZRangeBy{
+		Min: "-inf", Max: max,
+	}).Result()
+	if err != nil {
+		return nil, fmt.Errorf("만료 lease 조회 실패 (code=%s): %w", code, err)
+	}
+	if len(expired) == 0 {
+		return nil, nil
+	}
+	pipe := r.rdb.TxPipeline()
+	members := make([]interface{}, len(expired))
+	for i, uuid := range expired {
+		members[i] = uuid
+		pipe.Del(ctx, key(uuid))
+	}
+	pipe.ZRem(ctx, leasesKey(code), members...)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, fmt.Errorf("만료 lease 정리 실패 (code=%s): %w", code, err)
+	}
+	return expired, nil
+}
+
+// idleSince가 아직 없을 때만 now로 채운다. lease가 0개가 된 시점을 한 번만 기록한다.
+// 이미 찍혀 있으면 그대로 둔다(grace 계산 기준이 바뀌면 안 되므로).
+func (r *Registry) MarkIdle(ctx context.Context, code string, now time.Time) error {
+	if err := r.rdb.HSetNX(ctx, sharedKey(code), fieldIdleSince, formatUnix(now)).Err(); err != nil {
+		return fmt.Errorf("idle 시각 기록 실패 (code=%s): %w", code, err)
+	}
+	return nil
+}
+
 // ── lock ───────────────────────────────────────────────────────────────────
 
 // 문제 하나에 대한 lock을 잡는다. 이미 누가 잡고 있으면 ok=false.
