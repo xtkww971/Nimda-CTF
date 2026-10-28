@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,12 +22,13 @@ const accessMarker = "CTF_AGENT_ACCESS_OK"
 
 // TestAgentBuildsRunsAndIsReachable drives the whole Agent Create path against
 // real Docker: given a build context, the Agent builds an image, runs a
-// container, and returns host:port. The test then HTTP-GETs that address to
-// prove the instance is actually reachable, and finishes with Status (RUNNING)
-// and Destroy.
+// container, and returns host:port. The test then proves the instance is
+// reachable and finishes with Status (RUNNING) and Destroy.
 //
-// 떠 있는 컨테이너 목록을 통신으로 주고받던 경로는 걷어냈다. 어느 요청이 어느
-// 컨테이너인지는 조율자·에이전트가 공유하는 redis의 uuid: 기록이 들고 있다.
+// web(HTTP) 인스턴스는 더 이상 host 포트에 publish되지 않는다(#35, ADR-0017). ctf-instances
+// 네트워크에 붙고, 프록시가 같은 네트워크에서 컨테이너 이름으로 붙는다. 그래서 이 테스트도
+// 127.0.0.1:host포트가 아니라, 같은 네트워크에 임시 클라이언트 컨테이너를 띄워 컨테이너
+// 이름으로 접속되는지를 확인한다.
 //
 // 소켓 시절엔 이 테스트가 TCP로 프레임을 주고받으며 조율자 흉내를 냈다. 전송 계층을
 // 걷어냈으므로(ADR-0012) 이제 핸들러를 직접 부른다. 여기서 확인하려는 건 애초에
@@ -44,9 +45,17 @@ func TestAgentBuildsRunsAndIsReachable(t *testing.T) {
 	}
 	defer rt.Close()
 
+	// web 인스턴스가 붙을 네트워크. 운영의 ctf-instances와 같은 internal 네트워크를
+	// 테스트용 이름으로 따로 만든다. 프록시 역할의 클라이언트 컨테이너도 여기에 붙인다.
+	netName := fmt.Sprintf("ctf-instances-test%d", time.Now().UnixNano())
+	if out, err := exec.Command("docker", "network", "create", "--internal", netName).CombinedOutput(); err != nil {
+		t.Skipf("테스트 네트워크 생성 실패: %v (%s)", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("docker", "network", "rm", netName).Run() })
+
 	// 조율자가 압축을 푸는 공유 폴더 역할. Agent는 이 루트 아래 경로만 빌드한다.
 	buildRoot := t.TempDir()
-	handler := agentserver.NewDockerHandler(rt, "127.0.0.1", buildRoot, agentserver.PwnOptions{}, logger)
+	handler := agentserver.NewDockerHandler(rt, "127.0.0.1", netName, buildRoot, agentserver.PwnOptions{}, logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -56,9 +65,10 @@ func TestAgentBuildsRunsAndIsReachable(t *testing.T) {
 	image := "ctf-chal-" + code + ":latest"
 	// 웹이 사용자·문제마다 발급하는 값 자리. PER_USER 컨테이너 이름의 구분자가 된다.
 	uuid := fmt.Sprintf("uuid-%d", time.Now().UnixNano())
+	name := "ctf-" + code + "-" + uuid // PER_USER 컨테이너 이름 = web 접속 host
 	t.Cleanup(func() {
 		bg := context.Background()
-		_ = rt.Remove(bg, "ctf-"+code+"-"+uuid) // PER_USER name
+		_ = rt.Remove(bg, name)
 		rt.RemoveImage(bg, image)
 	})
 
@@ -80,21 +90,31 @@ func TestAgentBuildsRunsAndIsReachable(t *testing.T) {
 	if res.Status != protocol.StatusReady {
 		t.Fatalf("status = %q, want READY (message=%q)", res.Status, res.Message)
 	}
-	if res.Host != "127.0.0.1" || res.Port == 0 || res.InstanceID == "" {
-		t.Fatalf("접근 정보가 비어있음: %+v", res)
+	// web은 컨테이너 이름을 host로, 컨테이너가 EXPOSE한 포트(8080)를 포트로 돌려준다.
+	if res.Host != name {
+		t.Fatalf("web host가 컨테이너 이름이 아님: got %q want %q", res.Host, name)
+	}
+	if res.Port != 8080 {
+		t.Fatalf("web 포트가 EXPOSE 포트(8080)가 아님: %d", res.Port)
+	}
+	if res.InstanceID == "" {
+		t.Fatal("instanceID가 비어있음")
 	}
 	if res.ExpiresAt == "" {
 		t.Errorf("PER_USER 인스턴스는 만료 시각이 있어야 함")
 	}
+	// host 포트를 열지 않아야 한다(ADR-0017). inspect로 PortBindings가 비었는지 본다.
+	assertNoPublishedPort(t, res.InstanceID)
 	t.Logf("인스턴스 생성됨: %s:%d (id=%s)", res.Host, res.Port, res.InstanceID)
 
 	// ── 접근 확인 (핵심) ────────────────────────────────────────────────
+	// 같은 네트워크에 임시 클라이언트 컨테이너를 띄워, 컨테이너 이름으로 붙는다.
 	url := fmt.Sprintf("http://%s:%d/", res.Host, res.Port)
-	body := getWithRetry(t, url, 15*time.Second)
+	body := wgetFromNetwork(t, netName, url, 20*time.Second)
 	if !bytes.Contains(body, []byte(accessMarker)) {
 		t.Fatalf("접근은 됐지만 응답에 마커가 없음: %q", string(body))
 	}
-	t.Logf("접근 확인 완료: %s -> 마커 응답", url)
+	t.Logf("접근 확인 완료: %s(네트워크 %s) -> 마커 응답", url, netName)
 
 	// ── Status ──────────────────────────────────────────────────────────
 	status := handler.Status(ctx, &protocol.StatusRequest{UUID: uuid, InstanceID: res.InstanceID})
@@ -108,8 +128,8 @@ func TestAgentBuildsRunsAndIsReachable(t *testing.T) {
 		t.Fatalf("destroy 실패: %+v", destroy)
 	}
 
-	// 삭제 후에는 접근이 안 돼야 한다.
-	if _, err := http.Get(url); err == nil {
+	// 삭제 후에는 이름이 안 풀려 접근이 안 돼야 한다.
+	if _, err := tryWgetOnce(netName, url); err == nil {
 		t.Errorf("삭제 후에도 %s 에 접근됨", url)
 	}
 }
@@ -123,7 +143,7 @@ func TestAgentRejectsBuildPathOutsideRoot(t *testing.T) {
 		t.Skipf("도커 데몬에 연결하지 못해 건너뜁니다: %v", err)
 	}
 	defer rt.Close()
-	handler := agentserver.NewDockerHandler(rt, "127.0.0.1", t.TempDir(), agentserver.PwnOptions{}, logger)
+	handler := agentserver.NewDockerHandler(rt, "127.0.0.1", "", t.TempDir(), agentserver.PwnOptions{}, logger)
 
 	res := handler.Create(context.Background(), &protocol.RequestMessage{
 		UUID:             "uuid-escape-1",
@@ -163,24 +183,42 @@ func writeBusyboxBuildDir(t *testing.T, root string) string {
 	return root
 }
 
-func getWithRetry(t *testing.T, url string, timeout time.Duration) []byte {
+// 같은 네트워크에 임시 클라이언트 컨테이너를 띄워 url에 붙어 본다. 프록시가 할 일을 흉내낸다.
+// 컨테이너가 뜨고 httpd가 응답할 때까지 timeout 안에서 다시 시도한다.
+func wgetFromNetwork(t *testing.T, netName, url string, timeout time.Duration) []byte {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
-	var lastErr error
+	var last string
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(url)
+		out, err := tryWgetOnce(netName, url)
 		if err == nil {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return body
-			}
-			lastErr = fmt.Errorf("status %d", resp.StatusCode)
-		} else {
-			lastErr = err
+			return out
 		}
-		time.Sleep(300 * time.Millisecond)
+		last = err.Error() + ": " + string(out)
+		time.Sleep(500 * time.Millisecond)
 	}
-	t.Fatalf("%s 접근 실패 (%s 내): %v", url, timeout, lastErr)
+	t.Fatalf("%s 접근 실패 (%s 내): %s", url, timeout, last)
 	return nil
+}
+
+func tryWgetOnce(netName, url string) ([]byte, error) {
+	// busybox wget: -q 조용히, -O- 본문을 stdout으로, -T 3 타임아웃.
+	// internal 네트워크라도 같은 네트워크의 컨테이너끼리는 이름으로 닿는다.
+	cmd := exec.Command("docker", "run", "--rm", "--network", netName,
+		"busybox", "wget", "-q", "-O-", "-T", "3", url)
+	return cmd.CombinedOutput()
+}
+
+// web 인스턴스가 host 포트를 열지 않았는지 확인한다. 열려 있으면 PortBindings에 매핑이 있다.
+func assertNoPublishedPort(t *testing.T, id string) {
+	t.Helper()
+	out, err := exec.Command("docker", "inspect", "-f", "{{json .HostConfig.PortBindings}}", id).CombinedOutput()
+	if err != nil {
+		t.Fatalf("inspect 실패: %v (%s)", err, out)
+	}
+	// PortBindings가 없으면 "null" 또는 "{}"다.
+	s := strings.TrimSpace(string(out))
+	if s != "null" && s != "{}" {
+		t.Fatalf("web 인스턴스가 host 포트를 열었다: PortBindings=%s", s)
+	}
 }
