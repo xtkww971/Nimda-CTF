@@ -61,13 +61,17 @@ type Entry struct {
 // port는 TCP(pwn)일 때 밖에 연 포트다. HTTP(web)는 포트를 안 받으므로 0을 넘긴다.
 // 0이면 port 필드를 저장하지 않는다. "포트 없음"과 "0번 포트"를 구분할 필요가 없고,
 // 30000-30199 풀에서 0이 나올 일도 없기 때문이다.
-func (r *Registry) Save(ctx context.Context, uuid, instanceID string, port int) error {
+// expiresAt은 reaper가 만료를 집행하는 기준이다(ADR-0014). zero면 저장하지 않는다.
+func (r *Registry) Save(ctx context.Context, uuid, instanceID string, port int, expiresAt time.Time) error {
 	fields := []interface{}{
 		fieldIsolation, string(protocol.IsolationPerUser),
 		fieldInstanceID, instanceID,
 	}
 	if port != 0 {
 		fields = append(fields, fieldPort, strconv.Itoa(port))
+	}
+	if !expiresAt.IsZero() {
+		fields = append(fields, fieldExpiresAt, formatUnix(expiresAt))
 	}
 	if err := r.rdb.HSet(ctx, key(uuid), fields...).Err(); err != nil {
 		return fmt.Errorf("인스턴스 기록 실패 (uuid=%s): %w", uuid, err)
