@@ -64,7 +64,8 @@ func (h *DockerHandler) Create(ctx context.Context, req *protocol.RequestMessage
 		"nimda.ctf.uuid": req.UUID,
 	}
 
-	instanceID, port, err := h.rt.Run(ctx, image, name, env, labels)
+	// TODO(이슈 B 2단계): TCP면 할당 포트·바인딩 IP·ctf-pwn 네트워크로 채운다. 지금은 web과 동일.
+	instanceID, port, err := h.rt.Run(ctx, image, name, env, labels, runtime.RunSpec{})
 	if err != nil {
 		return failed(req.UUID, "컨테이너 실행 실패: "+err.Error())
 	}
