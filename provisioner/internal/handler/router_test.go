@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"testing"
 
+	protocol "nimda-ctf-protocol"
+
 	"nimda-judge-provisioner/internal/queue"
 )
 
@@ -115,6 +117,39 @@ func TestRouterFillsCreateInstanceMessage(t *testing.T) {
 	}
 	if got.FlagType != "STATIC" {
 		t.Errorf("FlagType = %q, want %q", got.FlagType, "STATIC")
+	}
+	// WEB은 웹 프록시로 붙으므로 HTTP다. agent는 이 값만 보고 포트를 밖에 열지 정한다.
+	if got.AccessType != protocol.AccessHTTP {
+		t.Errorf("AccessType = %q, want %q", got.AccessType, protocol.AccessHTTP)
+	}
+}
+
+// 카테고리마다 접속 방식이 정해진다. agent는 카테고리를 모르고 이 값만 받으므로,
+// 매핑이 틀어지면 web 포트가 열리거나 pwn이 안 붙는다.
+func TestCreateInstanceMessageCarriesAccessType(t *testing.T) {
+	tests := []struct {
+		category string
+		want     protocol.AccessType
+	}{
+		{"WEB", protocol.AccessHTTP},
+		{"PWN", protocol.AccessTCP},
+		{"pwn", protocol.AccessTCP}, // 소문자도 같게 본다
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.category, func(t *testing.T) {
+			r, spy := newRouterWithSpy()
+			if _, err := r.Handle(context.Background(), request(tc.category)); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			got, ok := spy.got.(*CreateInstanceMessage)
+			if !ok {
+				t.Fatalf("%q인데 *CreateInstanceMessage가 아님: %T", tc.category, spy.got)
+			}
+			if got.AccessType != tc.want {
+				t.Errorf("AccessType = %q, want %q", got.AccessType, tc.want)
+			}
+		})
 	}
 }
 
