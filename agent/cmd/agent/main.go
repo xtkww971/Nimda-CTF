@@ -29,10 +29,17 @@ import (
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	// 참가자가 인스턴스에 접속할 주소.
+	// web 참가자가 인스턴스에 접속할 주소.
 	host := getenv("CTF_INSTANCE_HOST", "127.0.0.1")
 	// 조율자와 공유하는 빌드 폴더 루트. 이 아래 경로만 빌드 컨텍스트로 허용한다.
 	buildRoot := getenv("CTF_BUILD_WORK_DIR", "/var/lib/ctf/build")
+
+	// pwn(TCP) 전용 설정. 포트 풀 범위·초기화는 4단계에서 붙인다.
+	pwn := agentserver.PwnOptions{
+		Host:    os.Getenv("CTF_PWN_PUBLIC_HOST"), // TCP를 쓸 거면 필수. 참가자에게 보여줄 주소
+		BindIP:  getenv("CTF_PWN_BIND_IP", "0.0.0.0"),
+		Network: getenv("CTF_PWN_NETWORK", "ctf-pwn"),
+	}
 
 	// 도커 데몬 소켓에 붙는다. 여기서 실패하면 이 프로세스가 할 수 있는 일이 없다.
 	rt, err := runtime.NewDocker(runtime.Options{
@@ -45,7 +52,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer rt.Close()
-	instances := agentserver.NewDockerHandler(rt, host, buildRoot, logger)
+	instances := agentserver.NewDockerHandler(rt, host, buildRoot, pwn, logger)
 
 	// 조율자와 공유하는 통. 요청·응답 스트림과 인스턴스 기록이 전부 여기 있다.
 	rdb := redis.NewClient(&redis.Options{
