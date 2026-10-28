@@ -23,6 +23,7 @@ import (
 	"nimda-ctf-agent/internal/agentqueue"
 	"nimda-ctf-agent/internal/agentserver"
 	"nimda-ctf-agent/internal/monitor"
+	"nimda-ctf-agent/internal/reaper"
 	"nimda-ctf-agent/internal/registry"
 	"nimda-ctf-agent/internal/runtime"
 )
@@ -120,6 +121,10 @@ func main() {
 	// 대시보드가 볼 snapshot을 주기적으로 ctf-redis에 쓴다 (Feature-01).
 	// agent는 listener를 열지 않기 때문에 이게 대시보드로 가는 유일한 통로다.
 	go monitor.New(rt, reg, rdb, logger).Run(ctx)
+
+	// 만료된 PER_USER 인스턴스를 주기적으로 내린다 (ADR-0014).
+	reapInterval := getenvDuration("CTF_REAP_INTERVAL", 30*time.Second)
+	go reaper.New(rt, reg, reapInterval, logger).Run(ctx)
 
 	consumer.Run(ctx)
 	logger.Info("shutdown signal received, agent stopped")
