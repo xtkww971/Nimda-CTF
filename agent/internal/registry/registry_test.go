@@ -438,3 +438,59 @@ func TestSaveStoresExpiresAt(t *testing.T) {
 		t.Error("expiresAt이 zero인데 hash에 필드가 저장됨")
 	}
 }
+
+// reaper ①: 만료된 lease는 집합에서 빠지고 그 uuid: 기록도 지워진다. 안 만료된 건 남는다.
+func TestPruneExpiredLeases(t *testing.T) {
+	r, rdb := newTestRegistry(t)
+	ctx := context.Background()
+	code := unique("web")
+	old, fresh := unique("u-old"), unique("u-fresh")
+	cleanup(t, rdb, sharedKey(code), leasesKey(code), key(old), key(fresh))
+
+	now := time.Now()
+	r.Join(ctx, code, old, now.Add(-time.Minute))  // 이미 만료
+	r.Join(ctx, code, fresh, now.Add(time.Hour))    // 유효
+
+	pruned, err := r.PruneExpiredLeases(ctx, code, now)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if len(pruned) != 1 || pruned[0] != old {
+		t.Fatalf("pruned = %v, want [%s]", pruned, old)
+	}
+	// 만료된 참가 기록은 사라지고, 유효한 건 남는다.
+	if e, _ := r.Entry(ctx, old); e != nil {
+		t.Errorf("만료 uuid 기록이 남음: %+v", e)
+	}
+	if e, _ := r.Entry(ctx, fresh); e == nil {
+		t.Error("유효 uuid 기록이 사라짐")
+	}
+	if n, _ := r.LeaseCount(ctx, code); n != 1 {
+		t.Errorf("lease 개수 = %d, want 1", n)
+	}
+}
+
+// reaper ②: idleSince는 처음 한 번만 찍힌다. 두 번째 호출은 기존 값을 안 덮는다.
+func TestMarkIdleOnce(t *testing.T) {
+	r, rdb := newTestRegistry(t)
+	ctx := context.Background()
+	code := unique("web")
+	cleanup(t, rdb, sharedKey(code))
+	r.SaveShared(ctx, code, "c-1") // idleSince 없음으로 시작
+
+	first := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := r.MarkIdle(ctx, code, first); err != nil {
+		t.Fatalf("mark1: %v", err)
+	}
+	// 두 번째는 다른 시각으로 — 덮어쓰면 안 된다.
+	if err := r.MarkIdle(ctx, code, time.Now()); err != nil {
+		t.Fatalf("mark2: %v", err)
+	}
+	s, err := r.Shared(ctx, code)
+	if err != nil || s == nil {
+		t.Fatalf("shared: %v", err)
+	}
+	if !s.IdleSince.Equal(first.UTC()) {
+		t.Errorf("IdleSince = %v, want %v (첫 값 유지)", s.IdleSince, first.UTC())
+	}
+}

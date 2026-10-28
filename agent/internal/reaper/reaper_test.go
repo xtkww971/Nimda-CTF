@@ -35,6 +35,14 @@ type fakeStore struct {
 	entries  map[string]*registry.Entry
 	deleted  []string
 	released []int
+
+	// SHARED
+	shared       map[string]*registry.SharedInstance
+	leaseCount   map[string]int64
+	locked       map[string]bool // 이미 누가 잡고 있는 code (Lock이 false 반환)
+	pruned       map[string]bool // PruneExpiredLeases 호출된 code
+	markedIdle   []string        // MarkIdle 호출된 code
+	deletedShare []string        // DeleteShared 호출된 code
 }
 
 func (s *fakeStore) AllEntries(context.Context) (map[string]*registry.Entry, error) {
@@ -49,9 +57,37 @@ func (s *fakeStore) ReleasePort(_ context.Context, port int) error {
 	s.released = append(s.released, port)
 	return nil
 }
+func (s *fakeStore) AllShared(context.Context) (map[string]*registry.SharedInstance, error) {
+	return s.shared, nil
+}
+func (s *fakeStore) PruneExpiredLeases(_ context.Context, code string, _ time.Time) ([]string, error) {
+	if s.pruned == nil {
+		s.pruned = map[string]bool{}
+	}
+	s.pruned[code] = true
+	return nil, nil
+}
+func (s *fakeStore) MarkIdle(_ context.Context, code string, _ time.Time) error {
+	s.markedIdle = append(s.markedIdle, code)
+	return nil
+}
+func (s *fakeStore) LeaseCount(_ context.Context, code string) (int64, error) {
+	return s.leaseCount[code], nil
+}
+func (s *fakeStore) Lock(_ context.Context, code string, _ time.Duration) (string, bool, error) {
+	if s.locked[code] {
+		return "", false, nil
+	}
+	return "tok", true, nil
+}
+func (s *fakeStore) Unlock(context.Context, string, string) error { return nil }
+func (s *fakeStore) DeleteShared(_ context.Context, code string) error {
+	s.deletedShare = append(s.deletedShare, code)
+	return nil
+}
 
 func newReaper(rt Containers, store Store) *Reaper {
-	r := New(rt, store, time.Minute, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r := New(rt, store, time.Minute, 10*time.Minute, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	r.now = func() time.Time { return time.Unix(1_000_000, 0).UTC() } // 고정 시각
 	return r
 }
@@ -168,5 +204,97 @@ func TestOrphanSkipsKnown(t *testing.T) {
 
 	if len(rt.removed) != 0 {
 		t.Errorf("registry가 아는 컨테이너를 orphan으로 지움: %v", rt.removed)
+	}
+}
+
+// ── SHARED idle 회수 (#34) ──────────────────────────────────────────────────
+
+// 만료 lease 정리는 lock과 무관하게 매번 돈다.
+func TestSharedPrunesLeasesAlways(t *testing.T) {
+	rt := &fakeContainers{}
+	store := &fakeStore{
+		shared:     map[string]*registry.SharedInstance{"web-01": {InstanceID: "c-1"}},
+		leaseCount: map[string]int64{"web-01": 3}, // 쓰는 사람 있음
+	}
+	newReaper(rt, store).reap(context.Background())
+
+	if !store.pruned["web-01"] {
+		t.Error("만료 lease 정리를 호출하지 않음")
+	}
+	if len(rt.removed) != 0 || len(store.deletedShare) != 0 {
+		t.Errorf("lease가 남았는데 컨테이너를 내림: removed=%v deleted=%v", rt.removed, store.deletedShare)
+	}
+}
+
+// lease가 0개가 된 순간엔 바로 안 내리고 idleSince만 찍는다.
+func TestSharedMarksIdleFirst(t *testing.T) {
+	rt := &fakeContainers{}
+	store := &fakeStore{
+		shared:     map[string]*registry.SharedInstance{"web-01": {InstanceID: "c-1"}}, // IdleSince zero
+		leaseCount: map[string]int64{"web-01": 0},
+	}
+	newReaper(rt, store).reap(context.Background())
+
+	if len(store.markedIdle) != 1 || store.markedIdle[0] != "web-01" {
+		t.Errorf("idleSince를 안 찍음: %v", store.markedIdle)
+	}
+	if len(rt.removed) != 0 {
+		t.Errorf("idle 찍은 첫 주기에 내림: %v", rt.removed)
+	}
+}
+
+// idleSince로부터 grace가 안 지났으면 유지한다.
+func TestSharedKeepsWithinGrace(t *testing.T) {
+	rt := &fakeContainers{}
+	store := &fakeStore{
+		shared: map[string]*registry.SharedInstance{
+			"web-01": {InstanceID: "c-1", IdleSince: time.Unix(1_000_000-300, 0).UTC()}, // now-5m < 10m
+		},
+		leaseCount: map[string]int64{"web-01": 0},
+	}
+	newReaper(rt, store).reap(context.Background())
+
+	if len(rt.removed) != 0 || len(store.deletedShare) != 0 {
+		t.Errorf("grace 안 지났는데 내림: removed=%v deleted=%v", rt.removed, store.deletedShare)
+	}
+}
+
+// lease 0개 + grace 경과 → 컨테이너와 기록을 내린다.
+func TestSharedReapsAfterGrace(t *testing.T) {
+	rt := &fakeContainers{}
+	store := &fakeStore{
+		shared: map[string]*registry.SharedInstance{
+			"web-01": {InstanceID: "c-1", IdleSince: time.Unix(1_000_000-1200, 0).UTC()}, // now-20m > 10m
+		},
+		leaseCount: map[string]int64{"web-01": 0},
+	}
+	newReaper(rt, store).reap(context.Background())
+
+	if len(rt.removed) != 1 || rt.removed[0] != "c-1" {
+		t.Errorf("grace 지났는데 컨테이너를 안 내림: %v", rt.removed)
+	}
+	if len(store.deletedShare) != 1 || store.deletedShare[0] != "web-01" {
+		t.Errorf("공유 기록을 안 지움: %v", store.deletedShare)
+	}
+}
+
+// CREATE가 lock을 잡고 있으면(지우는 찰나 새 참가자) reaper는 이번 주기에 건드리지 않는다.
+func TestSharedSkipsWhenLocked(t *testing.T) {
+	rt := &fakeContainers{}
+	store := &fakeStore{
+		shared: map[string]*registry.SharedInstance{
+			"web-01": {InstanceID: "c-1", IdleSince: time.Unix(1_000_000-1200, 0).UTC()}, // grace 지남
+		},
+		leaseCount: map[string]int64{"web-01": 0},
+		locked:     map[string]bool{"web-01": true},
+	}
+	newReaper(rt, store).reap(context.Background())
+
+	if len(rt.removed) != 0 || len(store.deletedShare) != 0 {
+		t.Errorf("lock을 못 잡았는데 내림: removed=%v deleted=%v", rt.removed, store.deletedShare)
+	}
+	// lease 정리는 lock 전이라 돌아야 한다.
+	if !store.pruned["web-01"] {
+		t.Error("lock과 무관한 lease 정리까지 건너뜀")
 	}
 }
