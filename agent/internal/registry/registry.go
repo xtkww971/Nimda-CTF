@@ -22,6 +22,8 @@ const (
 	KeyPrefix       = "uuid:"
 	SharedKeyPrefix = "shared:"
 	LockKeyPrefix   = "lock:shared:"
+	// pwn 포트 풀. 아직 안 나간 포트 번호들을 담는 Set이다.
+	PortsFreeKey = "ctf:ports:free"
 )
 
 // hash 필드 이름
@@ -32,6 +34,7 @@ const (
 	fieldExpiresAt     = "expiresAt"
 	fieldCreatedAt     = "createdAt"
 	fieldIdleSince     = "idleSince"
+	fieldPort          = "port" // TCP(pwn)일 때만 있다. 반납할 때 어느 포트였는지 읽는다
 )
 
 type Registry struct {
@@ -50,15 +53,23 @@ type Entry struct {
 	InstanceID    string
 	ChallengeCode string
 	ExpiresAt     time.Time // 없으면 zero value
+	Port          int       // TCP(pwn)일 때 밖에 연 포트. HTTP면 0
 }
 
 // PER_USER 컨테이너를 저장한다. 같은 uuid로 다시 부르면 덮어쓴다.
-func (r *Registry) Save(ctx context.Context, uuid, instanceID string) error {
-	err := r.rdb.HSet(ctx, key(uuid),
+//
+// port는 TCP(pwn)일 때 밖에 연 포트다. HTTP(web)는 포트를 안 받으므로 0을 넘긴다.
+// 0이면 port 필드를 저장하지 않는다. "포트 없음"과 "0번 포트"를 구분할 필요가 없고,
+// 30000-30199 풀에서 0이 나올 일도 없기 때문이다.
+func (r *Registry) Save(ctx context.Context, uuid, instanceID string, port int) error {
+	fields := []interface{}{
 		fieldIsolation, string(protocol.IsolationPerUser),
 		fieldInstanceID, instanceID,
-	).Err()
-	if err != nil {
+	}
+	if port != 0 {
+		fields = append(fields, fieldPort, strconv.Itoa(port))
+	}
+	if err := r.rdb.HSet(ctx, key(uuid), fields...).Err(); err != nil {
 		return fmt.Errorf("인스턴스 기록 실패 (uuid=%s): %w", uuid, err)
 	}
 	return nil
@@ -82,6 +93,12 @@ func (r *Registry) Entry(ctx context.Context, uuid string) (*Entry, error) {
 		e.ExpiresAt, err = parseUnix(raw)
 		if err != nil {
 			return nil, fmt.Errorf("만료 시각 해석 실패 (uuid=%s): %w", uuid, err)
+		}
+	}
+	if raw := m[fieldPort]; raw != "" {
+		e.Port, err = strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("포트 해석 실패 (uuid=%s): %w", uuid, err)
 		}
 	}
 	return e, nil
@@ -325,6 +342,70 @@ func (r *Registry) scan(ctx context.Context, pattern string) ([]string, error) {
 		return nil, fmt.Errorf("registry SCAN 실패 (pattern=%s): %w", pattern, err)
 	}
 	return keys, nil
+}
+
+// ── 포트 풀 (pwn/TCP) ────────────────────────────────────────────────────────
+// 풀은 "아직 안 나간 포트"를 담는 Set 하나다(ADR-0013, ADR-0020).
+// "누가 어느 포트를 쓰나"는 컨테이너 라벨 nimda.ctf.port로 알 수 있어서 따로 저장하지 않는다.
+
+// 포트를 하나 꺼낸다. SPOP은 원자적이라 두 요청이 같은 포트를 받는 일이 없다.
+// 풀이 비면 ok=false다. 부르는 쪽은 이때 "지금 자리가 없다"로 FAILED를 돌려준다.
+func (r *Registry) AllocatePort(ctx context.Context) (port int, ok bool, err error) {
+	raw, err := r.rdb.SPop(ctx, PortsFreeKey).Result()
+	if err == redis.Nil {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("포트 할당 실패: %w", err)
+	}
+	port, err = strconv.Atoi(raw)
+	if err != nil {
+		// 풀에 숫자가 아닌 값이 들어가 있다. 그 값은 버린다(다시 넣지 않는다).
+		return 0, false, fmt.Errorf("풀에 숫자가 아닌 포트가 있습니다 (%q): %w", raw, err)
+	}
+	return port, true, nil
+}
+
+// 포트를 풀에 되돌린다. Set이라 같은 포트를 두 번 넣어도 하나만 남는다.
+func (r *Registry) ReleasePort(ctx context.Context, port int) error {
+	if err := r.rdb.SAdd(ctx, PortsFreeKey, strconv.Itoa(port)).Err(); err != nil {
+		return fmt.Errorf("포트 반납 실패 (port=%d): %w", port, err)
+	}
+	return nil
+}
+
+// 풀을 다시 계산한다. free = {lo..hi} - used.
+//
+// used는 지금 떠 있는 컨테이너가 쓰는 포트다(nimda.ctf.port 라벨). 도커를 보는 일이라
+// 호출부(runtime)가 모아서 넘긴다. 여기서는 숫자 집합만 받는다.
+//
+// 반납을 못 하고 죽으면 포트가 풀에서 사라진 채로 남는다(ADR-0013). 실제로 떠 있는
+// 컨테이너를 기준으로 다시 계산하면 redis 값이 어떻게 틀어져 있든 맞춰진다.
+// agent가 시작할 때 한 번 부른다.
+func (r *Registry) InitPortPool(ctx context.Context, lo, hi int, used []int) error {
+	taken := make(map[int]bool, len(used))
+	for _, p := range used {
+		taken[p] = true
+	}
+
+	free := make([]interface{}, 0, hi-lo+1)
+	for p := lo; p <= hi; p++ {
+		if !taken[p] {
+			free = append(free, strconv.Itoa(p))
+		}
+	}
+
+	// 기존 풀을 통째로 갈아끼운다. 지우고 다시 넣는 사이에 할당이 끼면 그 포트를 잃지만,
+	// 시작 시 한 번만 부르고 그때는 CREATE를 아직 안 받으므로 끼어들 할당이 없다.
+	pipe := r.rdb.TxPipeline()
+	pipe.Del(ctx, PortsFreeKey)
+	if len(free) > 0 {
+		pipe.SAdd(ctx, PortsFreeKey, free...)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("포트 풀 초기화 실패 (%d-%d): %w", lo, hi, err)
+	}
+	return nil
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
