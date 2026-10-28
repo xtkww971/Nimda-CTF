@@ -95,8 +95,14 @@ func (h *DockerHandler) Create(ctx context.Context, req *protocol.RequestMessage
 
 	spec, host := h.runParams(req.AccessType, hostPort)
 	if req.AccessType != protocol.AccessTCP {
-		// web은 컨테이너 이름으로 붙는다(ADR-0017). 프록시가 같은 네트워크에서 이 이름으로 접속한다.
-		host = name
+		// web은 짧은 alias로 붙는다(#39). 컨테이너 이름(ctf-{code}-{uuid})은 code가 길면
+		// DNS 라벨 한계(63자)를 넘어 프록시가 못 붙는다. alias는 code 길이와 무관하게 짧다.
+		alias := instanceAlias(string(req.IsolationType), code, req.UUID)
+		if len(alias) > 63 {
+			return failed(req.UUID, fmt.Sprintf("web 접속 이름(alias)이 63자를 넘습니다(%d자): %q", len(alias), alias))
+		}
+		spec.NetworkAlias = alias
+		host = alias
 	}
 	instanceID, port, err := h.rt.Run(ctx, image, name, env, labels, spec)
 	if err != nil {
@@ -187,13 +193,12 @@ func failed(uuid, msg string) *protocol.ResponseMessage {
 
 // 이미 떠 있는 인스턴스를 그대로 돌려준다. 재배달이나 중복 요청일 때 쓴다.
 func (h *DockerHandler) Existing(ctx context.Context, uuid, instanceID string, access protocol.AccessType) *protocol.ResponseMessage {
-	running, port, name, err := h.rt.Running(ctx, instanceID)
+	running, port, host, err := h.rt.Running(ctx, instanceID)
 	if err != nil || !running {
 		return nil
 	}
-	// 이미 떠 있는 컨테이너의 포트를 그대로 쓴다. 보여줄 host만 접속 방식에 따라 고른다.
-	// web은 컨테이너 이름으로 붙고(ADR-0017), pwn은 참가자에게 보여줄 pwn 주소다.
-	host := name
+	// 이미 떠 있는 컨테이너의 포트와 host를 그대로 쓴다. web은 네트워크 alias(#39),
+	// pwn은 참가자에게 보여줄 pwn 주소다.
 	if access == protocol.AccessTCP {
 		host = h.pwn.Host
 	}
@@ -229,6 +234,16 @@ func instanceName(code, isolation, uuid string) (string, error) {
 		return "", fmt.Errorf("컨테이너 이름에 쓸 수 없는 uuid입니다: %q", uuid)
 	}
 	return fmt.Sprintf("ctf-%s-%s", code, uuid), nil
+}
+
+// web(HTTP) 인스턴스가 ctf-instances에서 쓸 짧은 네트워크 alias(#39).
+// PER_USER는 uuid로, SHARED는 code로 묶는다. 컨테이너 이름(ctf-{code}-{uuid})과 달리
+// code 길이에 휘둘리지 않아 DNS 라벨 한계(63자)를 넘지 않는다.
+func instanceAlias(isolation, code, uuid string) string {
+	if isolation == "PER_USER" {
+		return runtime.AliasPerUserPrefix + uuid
+	}
+	return runtime.AliasSharedPrefix + code
 }
 
 // ChallengeCode 공격 필터링 - 문자만 들어갈 수 있게 허용
