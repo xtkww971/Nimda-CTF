@@ -96,3 +96,11 @@ networks:
   # 웹사이트 컨테이너 네트워크
   nimda-network:
     external: true
+
+  # pwn(TCP) 문제 인스턴스 전용 네트워크 (ADR-0020).
+  # agent가 도커 소켓으로 만든 문제 컨테이너를 CTF_PWN_NETWORK 이름으로 여기에 붙인다.
+  # compose 서비스 중 아무도 이 네트워크를 안 쓰므로(agent는 소켓으로 직접 만든다) compose가
+  # 만들어 주지 않는다. 그래서 enable_icc=false 같은 옵션과 함께 docker network create로
+  # 미리 만들고(docs/runbook), 여기서는 external로 "밖에서 만든다"만 표시한다.
+  ctf-pwn:
+    external: true
