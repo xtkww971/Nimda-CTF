@@ -24,10 +24,11 @@ type PwnOptions struct {
 }
 
 type DockerHandler struct {
-	rt   *runtime.Docker
-	log  *slog.Logger
-	host string     // web 참가자가 접속하는 주소 (예: "chal.nimda.kr")
-	pwn  PwnOptions // pwn(TCP) 전용 설정
+	rt          *runtime.Docker
+	log         *slog.Logger
+	host        string     // Status가 보여주는 주소 (CTF_INSTANCE_HOST)
+	instanceNet string     // web(HTTP) 인스턴스를 붙일 네트워크 (CTF_INSTANCE_NETWORK)
+	pwn         PwnOptions // pwn(TCP) 전용 설정
 
 	// buildRoot는 빌드 컨텍스트 경로가 반드시 그 아래여야 하는 허용 루트다. Provisioner가
 	// 넘긴 경로를 그대로 믿으면 임의 호스트 경로(예: /)를 빌드 컨텍스트로 삼을 수 있으므로,
@@ -35,18 +36,19 @@ type DockerHandler struct {
 	buildRoot string
 }
 
-func NewDockerHandler(rt *runtime.Docker, host, buildRoot string, pwn PwnOptions, log *slog.Logger) *DockerHandler {
-	return &DockerHandler{rt: rt, host: host, buildRoot: buildRoot, pwn: pwn, log: log}
+func NewDockerHandler(rt *runtime.Docker, host, instanceNet, buildRoot string, pwn PwnOptions, log *slog.Logger) *DockerHandler {
+	return &DockerHandler{rt: rt, host: host, instanceNet: instanceNet, buildRoot: buildRoot, pwn: pwn, log: log}
 }
 
-// 접속 방식에 따라 실행 옵션과 참가자에게 보여줄 host를 정한다.
+// 접속 방식에 따라 실행 옵션과 보여줄 host를 정한다.
 // TCP(pwn)는 할당받은 포트를 지정 IP·ctf-pwn 네트워크로 열고 pwn 주소를 보여준다.
-// HTTP(web)는 zero value spec(loopback 임의 포트, 기본 네트워크)과 web 주소를 쓴다.
+// HTTP(web)는 host 포트를 안 열고 ctf-instances에 붙는다. host는 Create가 컨테이너 이름으로
+// 채우므로 여기선 빈 값을 돌려준다(ADR-0017: 프록시가 컨테이너 이름으로 붙는다).
 func (h *DockerHandler) runParams(access protocol.AccessType, hostPort int) (runtime.RunSpec, string) {
 	if access == protocol.AccessTCP {
-		return runtime.RunSpec{BindIP: h.pwn.BindIP, HostPort: hostPort, Network: h.pwn.Network}, h.pwn.Host
+		return runtime.RunSpec{BindIP: h.pwn.BindIP, HostPort: hostPort, Network: h.pwn.Network, Publish: true}, h.pwn.Host
 	}
-	return runtime.RunSpec{}, h.host
+	return runtime.RunSpec{Network: h.instanceNet, Publish: false}, ""
 }
 
 // hostPort는 TCP일 때 dispatcher가 포트 풀에서 받아 넘긴 포트다. HTTP면 0이고 데몬이 고른다.
@@ -92,6 +94,10 @@ func (h *DockerHandler) Create(ctx context.Context, req *protocol.RequestMessage
 	}
 
 	spec, host := h.runParams(req.AccessType, hostPort)
+	if req.AccessType != protocol.AccessTCP {
+		// web은 컨테이너 이름으로 붙는다(ADR-0017). 프록시가 같은 네트워크에서 이 이름으로 접속한다.
+		host = name
+	}
 	instanceID, port, err := h.rt.Run(ctx, image, name, env, labels, spec)
 	if err != nil {
 		return failed(req.UUID, "컨테이너 실행 실패: "+err.Error())
@@ -135,7 +141,7 @@ func (h *DockerHandler) Destroy(ctx context.Context, uuid, instanceID string) *p
 }
 
 func (h *DockerHandler) Status(ctx context.Context, req *protocol.StatusRequest) *protocol.StatusResult {
-	running, port, err := h.rt.Running(ctx, req.InstanceID)
+	running, port, _, err := h.rt.Running(ctx, req.InstanceID)
 	if err != nil {
 		return &protocol.StatusResult{UUID: req.UUID, InstanceID: req.InstanceID,
 			State: protocol.StateNotFound, Message: err.Error()}
@@ -181,12 +187,13 @@ func failed(uuid, msg string) *protocol.ResponseMessage {
 
 // 이미 떠 있는 인스턴스를 그대로 돌려준다. 재배달이나 중복 요청일 때 쓴다.
 func (h *DockerHandler) Existing(ctx context.Context, uuid, instanceID string, access protocol.AccessType) *protocol.ResponseMessage {
-	running, port, err := h.rt.Running(ctx, instanceID)
+	running, port, name, err := h.rt.Running(ctx, instanceID)
 	if err != nil || !running {
 		return nil
 	}
 	// 이미 떠 있는 컨테이너의 포트를 그대로 쓴다. 보여줄 host만 접속 방식에 따라 고른다.
-	host := h.host
+	// web은 컨테이너 이름으로 붙고(ADR-0017), pwn은 참가자에게 보여줄 pwn 주소다.
+	host := name
 	if access == protocol.AccessTCP {
 		host = h.pwn.Host
 	}
