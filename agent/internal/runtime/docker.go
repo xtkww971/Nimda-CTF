@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,21 @@ type Options struct {
 	MemoryLimit string
 	PidsLimit   int
 }
+
+// 접속 방식에 따라 달라지는 실행 옵션. 부르는 쪽(handler)이 채워 넘긴다.
+// zero value면 지금까지의 HTTP(web) 동작과 같다 — loopback 임의 포트, 기본 네트워크.
+type RunSpec struct {
+	// host 포트를 열 IP. 비면 "127.0.0.1"(web). pwn은 "0.0.0.0"처럼 밖에서 닿는 IP.
+	BindIP string
+	// 열 host 포트. 0이면 데몬이 고른다(web). pwn은 포트 풀에서 받은 값.
+	HostPort int
+	// 붙일 네트워크. 비면 기본 bridge(web). pwn은 "ctf-pwn".
+	Network string
+}
+
+// 재시작 시 포트 풀을 다시 계산할 때 쓴다(이슈 #29의 InitPortPool).
+// nimda.ctf.port 라벨이 붙은 컨테이너의 포트를 모은다.
+const labelPort = labelMarker + ".port"
 
 type Docker struct {
 	cli  *client.Client
@@ -79,7 +95,7 @@ func (d *Docker) BuildImageFromDir(ctx context.Context, sourceDir, imageTag stri
 // 인스턴스 컨테이너마다 붙이는 라벨.
 const labelMarker = "nimda.ctf"
 
-func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map[string]string) (instanceID string, hostPort int, err error) {
+func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map[string]string, spec RunSpec) (instanceID string, hostPort int, err error) {
 	containerPort, err := d.exposedPort(ctx, imageTag)
 	if err != nil {
 		return "", 0, err
@@ -89,10 +105,30 @@ func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map
 	// PER_USER만 삭제하고 SHARED의 경우 삭제하지 않는다.
 	_ = d.Remove(ctx, name)
 
+	// 접속 방식별 값. zero value면 지금까지의 web 동작이다.
+	bindIP := spec.BindIP
+	if bindIP == "" {
+		bindIP = "127.0.0.1"
+	}
+	binding := nat.PortBinding{HostIP: bindIP} // HostPort 빈 값이면 데몬이 고른다
+	if spec.HostPort != 0 {
+		binding.HostPort = strconv.Itoa(spec.HostPort)
+	}
+
+	// TCP는 포트가 미리 정해져 있으므로, 재시작 때 풀 재계산이 읽을 수 있게 라벨에 박는다.
+	runLabels := labels
+	if spec.HostPort != 0 {
+		runLabels = make(map[string]string, len(labels)+1)
+		for k, v := range labels {
+			runLabels[k] = v
+		}
+		runLabels[labelPort] = strconv.Itoa(spec.HostPort)
+	}
+
 	cfg := &container.Config{
 		Image:        imageTag,
 		Env:          envList(env),
-		Labels:       containerLabels(labels),
+		Labels:       containerLabels(runLabels),
 		ExposedPorts: nat.PortSet{containerPort: struct{}{}},
 	}
 
@@ -100,9 +136,8 @@ func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map
 		Runtime:     d.opts.Runtime, // 빈 값이면 데몬 기본값
 		CapDrop:     []string{"ALL"},
 		SecurityOpt: []string{"no-new-privileges"},
-		// 컨테이너 EXPOSE 포트를 loopback의 랜덤 host 포트에 연다.
 		PortBindings: nat.PortMap{
-			containerPort: []nat.PortBinding{{HostIP: "127.0.0.1", HostPort: ""}},
+			containerPort: []nat.PortBinding{binding},
 		},
 	}
 	if d.opts.MemoryLimit != "" {
@@ -118,7 +153,13 @@ func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map
 		hostCfg.PidsLimit = &limit
 	}
 
-	created, err := d.cli.ContainerCreate(ctx, cfg, hostCfg, &network.NetworkingConfig{}, nil, name)
+	// 네트워크를 지정하면 그 네트워크에 붙인다. 비면 기본 bridge(web).
+	netCfg := &network.NetworkingConfig{}
+	if spec.Network != "" {
+		netCfg.EndpointsConfig = map[string]*network.EndpointSettings{spec.Network: {}}
+	}
+
+	created, err := d.cli.ContainerCreate(ctx, cfg, hostCfg, netCfg, nil, name)
 	if err != nil {
 		return "", 0, fmt.Errorf("컨테이너 생성 실패: %w", err)
 	}
@@ -201,6 +242,28 @@ func (d *Docker) List(ctx context.Context) ([]ContainerInfo, error) {
 		out = append(out, info)
 	}
 	return out, nil
+}
+
+// 지금 떠 있는 컨테이너가 쓰는 pwn 포트를 모은다(이슈 #29의 InitPortPool 입력).
+// nimda.ctf.port 라벨값을 읽는다. 라벨이 없거나(web) 숫자가 아니면 건너뛴다.
+func (d *Docker) UsedPorts(ctx context.Context) ([]int, error) {
+	list, err := d.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ports := make([]int, 0, len(list))
+	for _, c := range list {
+		raw, ok := c.Labels[labelPort]
+		if !ok {
+			continue
+		}
+		p, err := strconv.Atoi(raw)
+		if err != nil {
+			continue
+		}
+		ports = append(ports, p)
+	}
+	return ports, nil
 }
 
 // 컨테이너를 삭제 없는 컨테이너는 성공으로 판단
