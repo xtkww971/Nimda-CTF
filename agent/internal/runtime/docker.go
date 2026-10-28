@@ -57,7 +57,18 @@ type RunSpec struct {
 	// web(HTTP)은 false다. 이때 PortBindings를 안 걸고, Run이 돌려주는 포트는 host 포트가
 	// 아니라 컨테이너가 EXPOSE한 포트다. 프록시가 같은 네트워크에서 그 포트로 컨테이너 이름에 붙는다.
 	Publish bool
+	// web(HTTP)이 네트워크에서 쓸 짧은 alias(#39). embedded DNS가 이 이름도 풀어준다.
+	// 컨테이너 이름(ctf-{code}-{uuid})이 63자(DNS 라벨 한계)를 넘는 경우를 피한다. pwn은 안 쓴다.
+	NetworkAlias string
 }
+
+const (
+	// web 인스턴스가 ctf-instances에서 쓰는 짧은 네트워크 alias의 접두사(#39).
+	// 컨테이너 이름이 DNS 라벨 한계(63자)를 넘는 경우를 피하려고 둔다. handler가 만들고
+	// Running이 읽는다.
+	AliasPerUserPrefix = "i-" // PER_USER: i-{uuid}
+	AliasSharedPrefix  = "s-" // SHARED: s-{code}
+)
 
 // 재시작 시 포트 풀을 다시 계산할 때 쓴다(이슈 #29의 InitPortPool).
 // nimda.ctf.port 라벨이 붙은 컨테이너의 포트를 모은다.
@@ -189,10 +200,15 @@ func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map
 		hostCfg.Tmpfs = map[string]string{"/tmp": "size=" + d.opts.TmpfsSize}
 	}
 
-	// 네트워크를 지정하면 그 네트워크에 붙인다. 비면 기본 bridge(web).
+	// 네트워크를 지정하면 그 네트워크에 붙인다. 비면 기본 bridge.
+	// web은 alias를 같이 건다(#39). embedded DNS가 짧은 이름으로도 풀 수 있게 한다.
 	netCfg := &network.NetworkingConfig{}
 	if spec.Network != "" {
-		netCfg.EndpointsConfig = map[string]*network.EndpointSettings{spec.Network: {}}
+		ep := &network.EndpointSettings{}
+		if spec.NetworkAlias != "" {
+			ep.Aliases = []string{spec.NetworkAlias}
+		}
+		netCfg.EndpointsConfig = map[string]*network.EndpointSettings{spec.Network: ep}
 	}
 
 	created, err := d.cli.ContainerCreate(ctx, cfg, hostCfg, netCfg, nil, name)
@@ -222,12 +238,14 @@ func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map
 	return instanceID, hostPort, nil
 }
 
-// 컨테이너가 떠 있는지와 붙을 포트, 그리고 컨테이너 이름.
+// 컨테이너가 떠 있는지와 붙을 포트, 그리고 붙을 host 이름.
 //
 // 포트는 접속 방식에 따라 뜻이 다르다. pwn(TCP)은 host에 연 포트, web(HTTP)은 컨테이너가
 // EXPOSE한 포트다. host 바인딩이 있으면 그 host 포트를, 없으면 EXPOSE 포트를 돌려준다.
-// 이름은 web 재사용(Existing) 경로가 접속 host로 쓴다. web은 컨테이너 이름으로 붙기 때문이다.
-func (d *Docker) Running(ctx context.Context, nameOrID string) (running bool, port int, name string, err error) {
+//
+// host는 web 재사용(Existing) 경로가 접속 이름으로 쓴다. web은 네트워크 alias로 붙으므로(#39),
+// 심어둔 짧은 alias(i-/s- 접두사)가 있으면 그걸, 없으면 컨테이너 이름을 돌려준다.
+func (d *Docker) Running(ctx context.Context, nameOrID string) (running bool, port int, host string, err error) {
 	info, err := d.cli.ContainerInspect(ctx, nameOrID)
 	if err != nil {
 		// 컨테이너가 존재하지 않음. 조회 실패와 구분하지 않는다
@@ -236,17 +254,27 @@ func (d *Docker) Running(ctx context.Context, nameOrID string) (running bool, po
 	if info.State == nil || !info.State.Running {
 		return false, 0, "", nil
 	}
-	name = strings.TrimPrefix(info.Name, "/")
+	host = strings.TrimPrefix(info.Name, "/")
+	// web은 네트워크 alias로 붙는다(#39). 심어둔 짧은 alias(i-/s-)가 있으면 그걸 host로 쓴다.
+	if info.NetworkSettings != nil {
+		for _, n := range info.NetworkSettings.Networks {
+			for _, a := range n.Aliases {
+				if strings.HasPrefix(a, AliasPerUserPrefix) || strings.HasPrefix(a, AliasSharedPrefix) {
+					host = a
+				}
+			}
+		}
+	}
 
 	exposed, err := firstExposedPort(info.Config.ExposedPorts)
 	if err != nil {
-		return true, 0, name, nil // 떠 있지만 포트를 모른다
+		return true, 0, host, nil // 떠 있지만 포트를 모른다
 	}
 	// host 바인딩이 있으면 host 포트(pwn), 없으면 EXPOSE 포트(web)를 돌려준다.
 	if hostPort, err := portFromBindings(info.NetworkSettings.Ports, exposed); err == nil {
-		return true, hostPort, name, nil
+		return true, hostPort, host, nil
 	}
-	return true, exposed.Int(), name, nil
+	return true, exposed.Int(), host, nil
 }
 
 // 모니터링에 쓰는 컨테이너 정보 (Feature-01).
