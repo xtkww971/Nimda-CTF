@@ -26,8 +26,8 @@ type PwnOptions struct {
 type DockerHandler struct {
 	rt   *runtime.Docker
 	log  *slog.Logger
-	host string      // web 참가자가 접속하는 주소 (예: "chal.nimda.kr")
-	pwn  PwnOptions  // pwn(TCP) 전용 설정
+	host string     // web 참가자가 접속하는 주소 (예: "chal.nimda.kr")
+	pwn  PwnOptions // pwn(TCP) 전용 설정
 
 	// buildRoot는 빌드 컨텍스트 경로가 반드시 그 아래여야 하는 허용 루트다. Provisioner가
 	// 넘긴 경로를 그대로 믿으면 임의 호스트 경로(예: /)를 빌드 컨텍스트로 삼을 수 있으므로,
@@ -79,8 +79,16 @@ func (h *DockerHandler) Create(ctx context.Context, req *protocol.RequestMessage
 	// 나중에 List가 이 인스턴스를 알아보게 라벨을 붙인다.
 	// 사용자 ID 대신 UUID를 남긴다 — 에이전트는 요청한 사람이 누구인지 모르고, 알 필요도 없다.
 	labels := map[string]string{
-		"nimda.ctf.code": req.ChallengeCode,
-		"nimda.ctf.uuid": req.UUID,
+		"nimda.ctf.code":  req.ChallengeCode,
+		runtime.LabelUUID: req.UUID,
+	}
+
+	// PER_USER 만료 시각은 Run 전에 정한다. 응답에도 쓰고, reaper가 registry를 잃어도 회수할 수 있게
+	// 컨테이너 라벨에도 박는다(ADR-0014의 orphan 회수).
+	var expiresAt time.Time
+	if req.IsolationType == "PER_USER" {
+		expiresAt = time.Now().Add(perUserTTL).UTC()
+		labels[runtime.LabelExpires] = expiresAt.Format(time.RFC3339)
 	}
 
 	spec, host := h.runParams(req.AccessType, hostPort)
@@ -97,8 +105,8 @@ func (h *DockerHandler) Create(ctx context.Context, req *protocol.RequestMessage
 		Host:       host,
 		Port:       port,
 	}
-	if req.IsolationType == "PER_USER" {
-		res.ExpiresAt = time.Now().Add(perUserTTL).UTC().Format(time.RFC3339)
+	if !expiresAt.IsZero() {
+		res.ExpiresAt = expiresAt.Format(time.RFC3339)
 	}
 	h.log.Info("create 완료", "uuid", req.UUID, "instanceId", instanceID,
 		"host", res.Host, "port", res.Port)
