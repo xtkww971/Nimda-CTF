@@ -53,6 +53,8 @@ func main() {
 		Runtime:     os.Getenv("CTF_CONTAINER_RUNTIME"), // "" = default; "runsc" in prod (gVisor)
 		MemoryLimit: getenv("CTF_INSTANCE_MEMORY", "256m"),
 		PidsLimit:   getenvInt("CTF_INSTANCE_PIDS", 256),
+		CPULimit:    getenvFloat("CTF_INSTANCE_CPU", 0.5),
+		TmpfsSize:   getenv("CTF_INSTANCE_TMPFS_SIZE", "64m"),
 	})
 	if err != nil {
 		logger.Error("도커 데몬에 연결하지 못했습니다", "error", err)
@@ -190,6 +192,15 @@ func getenvInt(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return fallback
+}
+
+func getenvFloat(key string, fallback float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return fallback
