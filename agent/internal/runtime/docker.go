@@ -33,6 +33,14 @@ type Options struct {
 	// 인스턴스마다 거는 메모리/프로세스 상한
 	MemoryLimit string
 	PidsLimit   int
+
+	// CPU 상한(코어 수). 0.5면 반 코어. 0이면 상한 없음.
+	// 무한 루프·fork bomb이 호스트 CPU를 다 먹는 걸 막는다.
+	CPULimit float64
+
+	// 쓰기용 tmpfs(/tmp) 크기. "64m" 같은 문자열. 비면 tmpfs를 안 붙인다(개발용).
+	// rootfs를 읽기 전용으로 만들기 때문에, 런타임에 쓸 자리를 여기 하나만 연다.
+	TmpfsSize string
 }
 
 // 접속 방식에 따라 달라지는 실행 옵션. 부르는 쪽(handler)이 채워 넘긴다.
@@ -136,6 +144,9 @@ func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map
 		Runtime:     d.opts.Runtime, // 빈 값이면 데몬 기본값
 		CapDrop:     []string{"ALL"},
 		SecurityOpt: []string{"no-new-privileges"},
+		// 파일시스템을 읽기 전용으로 만든다. dd로 디스크를 채울 자리를 없앤다.
+		// 쓰기가 필요한 곳은 아래 tmpfs(/tmp) 하나뿐이다.
+		ReadonlyRootfs: true,
 		PortBindings: nat.PortMap{
 			containerPort: []nat.PortBinding{binding},
 		},
@@ -151,6 +162,15 @@ func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map
 	if d.opts.PidsLimit > 0 {
 		limit := int64(d.opts.PidsLimit)
 		hostCfg.PidsLimit = &limit
+	}
+	if d.opts.CPULimit > 0 {
+		// API는 나노 단위 코어 수를 받는다. 0.5코어 = 500_000_000.
+		hostCfg.NanoCPUs = int64(d.opts.CPULimit * 1e9)
+	}
+	if d.opts.TmpfsSize != "" {
+		// 읽기 전용 rootfs에서 쓰기가 필요한 유일한 자리. 크기를 못박아 디스크·메모리를 못 채우게 한다.
+		// tmpfs는 메모리를 쓰므로 위 Memory 상한에도 같이 묶인다.
+		hostCfg.Tmpfs = map[string]string{"/tmp": "size=" + d.opts.TmpfsSize}
 	}
 
 	// 네트워크를 지정하면 그 네트워크에 붙인다. 비면 기본 bridge(web).
