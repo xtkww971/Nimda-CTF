@@ -31,8 +31,10 @@ import (
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	// web 참가자가 인스턴스에 접속할 주소.
+	// Status가 보여주는 주소.
 	host := getenv("CTF_INSTANCE_HOST", "127.0.0.1")
+	// web(HTTP) 인스턴스를 붙일 네트워크. 프록시가 같은 네트워크에서 컨테이너 이름으로 붙는다(ADR-0017).
+	instanceNet := getenv("CTF_INSTANCE_NETWORK", "ctf-instances")
 	// 조율자와 공유하는 빌드 폴더 루트. 이 아래 경로만 빌드 컨텍스트로 허용한다.
 	buildRoot := getenv("CTF_BUILD_WORK_DIR", "/var/lib/ctf/build")
 
@@ -62,7 +64,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer rt.Close()
-	instances := agentserver.NewDockerHandler(rt, host, buildRoot, pwn, logger)
+	instances := agentserver.NewDockerHandler(rt, host, instanceNet, buildRoot, pwn, logger)
 
 	// 조율자와 공유하는 통. 요청·응답 스트림과 인스턴스 기록이 전부 여기 있다.
 	rdb := redis.NewClient(&redis.Options{
