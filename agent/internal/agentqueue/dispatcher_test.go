@@ -49,29 +49,49 @@ func (f *fakeInstances) Existing(_ context.Context, _, _ string, _ protocol.Acce
 
 // 메모리 registry.
 type fakeRegistry struct {
-	saved   map[string]string // PER_USER: uuid → instanceID
-	readErr error
+	saved     map[string]string // PER_USER: uuid → instanceID
+	savedPort map[string]int    // PER_USER: uuid → 저장된 port
+	readErr   error
 
 	joined  map[string]string               // SHARED: uuid → challengeCode
 	leases  map[string]map[string]time.Time // code → uuid → 만료 시각
 	shared  map[string]string               // code → instanceID
 	locked  map[string]bool                 // code → lock 잡힘
 	unlocks int
+
+	freePorts []int // AllocatePort가 꺼내 줄 포트 (앞에서부터)
+	released  []int // ReleasePort로 되돌아온 포트 (검증용)
 }
 
 func newFakeRegistry() *fakeRegistry {
 	return &fakeRegistry{
-		saved:  map[string]string{},
-		joined: map[string]string{},
-		leases: map[string]map[string]time.Time{},
-		shared: map[string]string{},
-		locked: map[string]bool{},
+		saved:     map[string]string{},
+		savedPort: map[string]int{},
+		joined:    map[string]string{},
+		leases:    map[string]map[string]time.Time{},
+		shared:    map[string]string{},
+		locked:    map[string]bool{},
 	}
 }
 
 func (r *fakeRegistry) Save(_ context.Context, uuid, instanceID string, port int) error {
 	r.saved[uuid] = instanceID
-	_ = port // 포트를 받아 넘기는 분기는 다음 이슈. 지금은 0만 온다.
+	r.savedPort[uuid] = port
+	return nil
+}
+
+func (r *fakeRegistry) AllocatePort(_ context.Context) (int, bool, error) {
+	if len(r.freePorts) == 0 {
+		return 0, false, nil
+	}
+	p := r.freePorts[0]
+	r.freePorts = r.freePorts[1:]
+	return p, true, nil
+}
+
+func (r *fakeRegistry) ReleasePort(_ context.Context, port int) error {
+	r.released = append(r.released, port)
+	r.freePorts = append(r.freePorts, port)
 	return nil
 }
 
@@ -92,7 +112,7 @@ func (r *fakeRegistry) Entry(_ context.Context, uuid string) (*registry.Entry, e
 		return nil, r.readErr
 	}
 	if id, ok := r.saved[uuid]; ok {
-		return &registry.Entry{Isolation: protocol.IsolationPerUser, InstanceID: id}, nil
+		return &registry.Entry{Isolation: protocol.IsolationPerUser, InstanceID: id, Port: r.savedPort[uuid]}, nil
 	}
 	if code, ok := r.joined[uuid]; ok {
 		return &registry.Entry{Isolation: protocol.IsolationShared, ChallengeCode: code,
@@ -476,5 +496,125 @@ func TestCreateRejectsUnknownIsolation(t *testing.T) {
 	}
 	if inst.createCalls != 0 {
 		t.Errorf("모르는 값인데 만들었음 (Create 호출 %d회)", inst.createCalls)
+	}
+}
+
+// ── TCP(pwn) 포트 풀 분기 (이슈 B) ───────────────────────────────────────────
+
+func tcpReq(uuid, dir string) *protocol.RequestMessage {
+	return &protocol.RequestMessage{
+		UUID: uuid, Action: protocol.ActionCreate,
+		ChallengeCode: "pwn-bof", IsolationType: "PER_USER",
+		AccessType: protocol.AccessTCP, FlagType: "STATIC",
+		BuildContextPath: dir,
+	}
+}
+
+// TCP면 풀에서 포트를 받아 Create에 넘기고, 그 포트를 기록한다.
+func TestCreateTCPAllocatesPort(t *testing.T) {
+	inst := &fakeInstances{}
+	reg := newFakeRegistry()
+	reg.freePorts = []int{30042}
+
+	res, err := newDispatcher(inst, reg).Handle(context.Background(), tcpReq("uuid-1", buildDir(t)))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != protocol.StatusReady {
+		t.Fatalf("status = %q, want READY", res.Status)
+	}
+	if inst.lastPort != 30042 {
+		t.Errorf("Create에 넘긴 포트 = %d, want 30042", inst.lastPort)
+	}
+	if reg.savedPort["uuid-1"] != 30042 {
+		t.Errorf("기록된 포트 = %d, want 30042", reg.savedPort["uuid-1"])
+	}
+}
+
+// 풀이 비면 컨테이너를 만들지 않고 FAILED로 끝낸다.
+func TestCreateTCPPoolEmptyFails(t *testing.T) {
+	inst := &fakeInstances{}
+	reg := newFakeRegistry() // freePorts 비어 있음
+
+	res, err := newDispatcher(inst, reg).Handle(context.Background(), tcpReq("uuid-1", buildDir(t)))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != protocol.StatusFailed {
+		t.Errorf("status = %q, want FAILED", res.Status)
+	}
+	if inst.createCalls != 0 {
+		t.Errorf("풀이 비었는데 Create를 호출함 (%d회)", inst.createCalls)
+	}
+}
+
+// 컨테이너가 안 뜨면 받은 포트를 풀에 되돌린다.
+func TestCreateTCPReleasesPortOnFailure(t *testing.T) {
+	inst := &fakeInstances{createResult: &protocol.ResponseMessage{
+		UUID: "uuid-1", Action: protocol.ActionCreate, Status: protocol.StatusFailed, Message: "빌드 실패",
+	}}
+	reg := newFakeRegistry()
+	reg.freePorts = []int{30042}
+
+	res, err := newDispatcher(inst, reg).Handle(context.Background(), tcpReq("uuid-1", buildDir(t)))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != protocol.StatusFailed {
+		t.Fatalf("status = %q, want FAILED", res.Status)
+	}
+	if len(reg.released) != 1 || reg.released[0] != 30042 {
+		t.Errorf("실패한 포트를 반납하지 않음: released=%v", reg.released)
+	}
+}
+
+// 기록은 있는데 컨테이너가 죽은 경우, 다시 만들기 전에 옛 포트를 반납한다.
+func TestCreateTCPReleasesOldPortOnRebuild(t *testing.T) {
+	inst := &fakeInstances{existing: nil} // 죽어 있다
+	reg := newFakeRegistry()
+	reg.saved["uuid-1"] = "dead-container"
+	reg.savedPort["uuid-1"] = 30042 // 옛 포트
+	reg.freePorts = []int{30099}    // 새로 받을 포트
+
+	res, err := newDispatcher(inst, reg).Handle(context.Background(), tcpReq("uuid-1", buildDir(t)))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != protocol.StatusReady {
+		t.Fatalf("status = %q, want READY", res.Status)
+	}
+	// 옛 포트가 반납됐어야 한다.
+	found := false
+	for _, p := range reg.released {
+		if p == 30042 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("옛 포트 30042를 반납하지 않음: released=%v", reg.released)
+	}
+	// 새 포트로 다시 만들고 기록해야 한다.
+	if inst.lastPort != 30099 || reg.savedPort["uuid-1"] != 30099 {
+		t.Errorf("새 포트로 안 떴음: lastPort=%d saved=%d", inst.lastPort, reg.savedPort["uuid-1"])
+	}
+}
+
+// DESTROY하면 컨테이너를 지운 뒤 포트를 풀에 되돌린다.
+func TestDestroyTCPReleasesPort(t *testing.T) {
+	inst := &fakeInstances{}
+	reg := newFakeRegistry()
+	reg.saved["uuid-1"] = "c-1"
+	reg.savedPort["uuid-1"] = 30050
+
+	res, err := newDispatcher(inst, reg).Handle(context.Background(),
+		&protocol.RequestMessage{UUID: "uuid-1", Action: protocol.ActionDestroy})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != protocol.StatusDestroyed {
+		t.Fatalf("status = %q, want DESTROYED", res.Status)
+	}
+	if len(reg.released) != 1 || reg.released[0] != 30050 {
+		t.Errorf("DESTROY가 포트를 반납하지 않음: released=%v", reg.released)
 	}
 }
