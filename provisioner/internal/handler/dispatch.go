@@ -71,12 +71,18 @@ func NewHandler(s3 S3Downloader, agent agentclient.Dispatcher, cfg config.Config
 }
 
 func (h *Handler) Handle(ctx context.Context, msg *CreateInstanceMessage) (*queue.Result, error) {
+	// pwn(TCP)은 포트를 밖에 연다. SHARED로 뜨면 한 명이 셸을 따서 모두의 문제를 망친다.
+	// protocol 파서도 막지만, 여기서 먼저 걸러야 FAILED 사유가 웹에 바로 보인다. 다운로드도 아낀다.
+	if msg.AccessType == protocol.AccessTCP && msg.IsolationType == string(protocol.IsolationShared) {
+		return h.failed(msg, "pwn(TCP) 문제는 SHARED로 제공할 수 없습니다"), nil
+	}
+
 	// S3 키는 업로드 규칙 그대로 challenges/{code}/{code}.zip.
 	objectKey := "challenges/" + msg.ChallengeCode + "/" + msg.ChallengeCode + ".zip"
 
 	h.log.InfoContext(ctx, "create 처리 시작",
 		"uuid", msg.UUID, "challengeCode", msg.ChallengeCode,
-		"isolation", msg.IsolationType)
+		"isolation", msg.IsolationType, "access", msg.AccessType)
 
 	// 1) 다운로드.
 	zipData, err := h.s3.GetFile(ctx, objectKey)
@@ -97,6 +103,7 @@ func (h *Handler) Handle(ctx context.Context, msg *CreateInstanceMessage) (*queu
 		Action:           protocol.ActionCreate,
 		ChallengeCode:    msg.ChallengeCode,
 		IsolationType:    protocol.IsolationType(msg.IsolationType),
+		AccessType:       msg.AccessType,
 		FlagType:         msg.FlagType,
 		BuildContextPath: dir,
 		// Flag(DYNAMIC 주입값)은 플래그 설계 확정 후. 지금은 비움.
