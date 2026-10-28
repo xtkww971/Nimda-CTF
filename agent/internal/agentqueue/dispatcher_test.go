@@ -18,7 +18,7 @@ import (
 type fakeInstances struct {
 	createCalls  int
 	destroyCalls int
-	lastPort     int // Create에 넘어온 hostPort (TCP 분기 검증용)
+	lastPort     int                       // Create에 넘어온 hostPort (TCP 분기 검증용)
 	existing     *protocol.ResponseMessage // Existing이 돌려줄 값
 	createResult *protocol.ResponseMessage
 }
@@ -49,9 +49,10 @@ func (f *fakeInstances) Existing(_ context.Context, _, _ string, _ protocol.Acce
 
 // 메모리 registry.
 type fakeRegistry struct {
-	saved     map[string]string // PER_USER: uuid → instanceID
-	savedPort map[string]int    // PER_USER: uuid → 저장된 port
-	readErr   error
+	saved       map[string]string    // PER_USER: uuid → instanceID
+	savedPort   map[string]int       // PER_USER: uuid → 저장된 port
+	savedExpiry map[string]time.Time // PER_USER: uuid → 저장된 만료 시각
+	readErr     error
 
 	joined  map[string]string               // SHARED: uuid → challengeCode
 	leases  map[string]map[string]time.Time // code → uuid → 만료 시각
@@ -65,18 +66,20 @@ type fakeRegistry struct {
 
 func newFakeRegistry() *fakeRegistry {
 	return &fakeRegistry{
-		saved:     map[string]string{},
-		savedPort: map[string]int{},
-		joined:    map[string]string{},
-		leases:    map[string]map[string]time.Time{},
-		shared:    map[string]string{},
-		locked:    map[string]bool{},
+		saved:       map[string]string{},
+		savedPort:   map[string]int{},
+		savedExpiry: map[string]time.Time{},
+		joined:      map[string]string{},
+		leases:      map[string]map[string]time.Time{},
+		shared:      map[string]string{},
+		locked:      map[string]bool{},
 	}
 }
 
-func (r *fakeRegistry) Save(_ context.Context, uuid, instanceID string, port int) error {
+func (r *fakeRegistry) Save(_ context.Context, uuid, instanceID string, port int, expiresAt time.Time) error {
 	r.saved[uuid] = instanceID
 	r.savedPort[uuid] = port
+	r.savedExpiry[uuid] = expiresAt
 	return nil
 }
 

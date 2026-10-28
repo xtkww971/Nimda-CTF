@@ -42,7 +42,7 @@ func TestPerUserSaveAndLookup(t *testing.T) {
 	uuid := unique("u")
 	cleanup(t, rdb, key(uuid))
 
-	if err := r.Save(ctx, uuid, "container-1", 0); err != nil {
+	if err := r.Save(ctx, uuid, "container-1", 0, time.Time{}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	id, err := r.InstanceID(ctx, uuid)
@@ -266,7 +266,7 @@ func TestAllEntriesSharedAndLeases(t *testing.T) {
 	code, p, s := unique("web"), unique("p"), unique("s")
 	cleanup(t, rdb, key(p), key(s), sharedKey(code), leasesKey(code))
 
-	r.Save(ctx, p, "per-user-container", 0)
+	r.Save(ctx, p, "per-user-container", 0, time.Time{})
 	r.SaveShared(ctx, code, "shared-container")
 	exp := time.Now().Add(time.Hour).Truncate(time.Second).UTC()
 	r.Join(ctx, code, s, exp)
@@ -394,7 +394,7 @@ func TestSaveStoresPort(t *testing.T) {
 	withPort, noPort := unique("u-tcp"), unique("u-http")
 	cleanup(t, rdb, key(withPort), key(noPort))
 
-	if err := r.Save(ctx, withPort, "c-tcp", 30042); err != nil {
+	if err := r.Save(ctx, withPort, "c-tcp", 30042, time.Time{}); err != nil {
 		t.Fatalf("save with port: %v", err)
 	}
 	e, err := r.Entry(ctx, withPort)
@@ -402,7 +402,7 @@ func TestSaveStoresPort(t *testing.T) {
 		t.Fatalf("Entry.Port = %v (err=%v), want 30042", e, err)
 	}
 
-	if err := r.Save(ctx, noPort, "c-http", 0); err != nil {
+	if err := r.Save(ctx, noPort, "c-http", 0, time.Time{}); err != nil {
 		t.Fatalf("save no port: %v", err)
 	}
 	if ok := rdb.HExists(ctx, key(noPort), fieldPort).Val(); ok {
@@ -411,5 +411,30 @@ func TestSaveStoresPort(t *testing.T) {
 	e2, err := r.Entry(ctx, noPort)
 	if err != nil || e2 == nil || e2.Port != 0 {
 		t.Fatalf("Entry.Port = %v (err=%v), want 0", e2, err)
+	}
+}
+
+// reaper가 만료를 집행하려면 expiresAt이 저장되고 되읽혀야 한다(ADR-0014).
+func TestSaveStoresExpiresAt(t *testing.T) {
+	r, rdb := newTestRegistry(t)
+	ctx := context.Background()
+	withExp, noExp := unique("u-exp"), unique("u-noexp")
+	cleanup(t, rdb, key(withExp), key(noExp))
+
+	exp := time.Now().Add(time.Hour).Truncate(time.Second).UTC()
+	if err := r.Save(ctx, withExp, "c-1", 0, exp); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	e, err := r.Entry(ctx, withExp)
+	if err != nil || e == nil || !e.ExpiresAt.Equal(exp) {
+		t.Fatalf("Entry.ExpiresAt = %v (err=%v), want %v", e, err, exp)
+	}
+
+	// zero면 필드를 안 쓴다.
+	if err := r.Save(ctx, noExp, "c-2", 0, time.Time{}); err != nil {
+		t.Fatalf("save no exp: %v", err)
+	}
+	if ok := rdb.HExists(ctx, key(noExp), fieldExpiresAt).Val(); ok {
+		t.Error("expiresAt이 zero인데 hash에 필드가 저장됨")
 	}
 }
