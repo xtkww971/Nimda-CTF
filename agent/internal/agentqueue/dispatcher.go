@@ -12,10 +12,12 @@ import (
 
 // 실제 도커 조작을 하는 쪽 Handler
 type InstanceHandler interface {
-	Create(ctx context.Context, req *protocol.RequestMessage) *protocol.ResponseMessage
+	// hostPort는 TCP일 때 포트 풀에서 받은 포트다. HTTP면 0(데몬이 고른다).
+	Create(ctx context.Context, req *protocol.RequestMessage, hostPort int) *protocol.ResponseMessage
 	Destroy(ctx context.Context, uuid, instanceID string) *protocol.ResponseMessage
 	// 이미 떠 있으면 그 접속 정보를, 아니면 nil을 돌려준다.
-	Existing(ctx context.Context, uuid, instanceID string) *protocol.ResponseMessage
+	// access는 보여줄 host를 고르는 데만 쓴다(web 주소 vs pwn 주소).
+	Existing(ctx context.Context, uuid, instanceID string, access protocol.AccessType) *protocol.ResponseMessage
 }
 
 // uuid ↔ 컨테이너 기록. 구현은 registry 패키지(ADR-0019).
@@ -123,7 +125,7 @@ func (d *Dispatcher) createPerUser(ctx context.Context, req *protocol.RequestMes
 		return nil, err
 	}
 	if instanceID != "" {
-		if res := d.instances.Existing(ctx, req.UUID, instanceID); res != nil {
+		if res := d.instances.Existing(ctx, req.UUID, instanceID, req.AccessType); res != nil {
 			// 인스턴스가 존재하는 경우
 			d.cleanupBuildDir(ctx, req)
 			return res, nil
@@ -134,7 +136,8 @@ func (d *Dispatcher) createPerUser(ctx context.Context, req *protocol.RequestMes
 			"uuid", req.UUID, "instanceId", instanceID)
 	}
 
-	res := d.instances.Create(ctx, req)
+	// TODO(이슈 B 3단계): TCP면 여기서 포트를 할당해 넘긴다. 지금은 0(HTTP).
+	res := d.instances.Create(ctx, req, 0)
 
 	// 빌드가 끝난 이후 폴더 삭제
 	d.cleanupBuildDir(ctx, req)
@@ -214,14 +217,15 @@ func (d *Dispatcher) sharedInstance(ctx context.Context, req *protocol.RequestMe
 		return nil, err
 	}
 	if shared != nil {
-		if res := d.instances.Existing(ctx, req.UUID, shared.InstanceID); res != nil {
+		if res := d.instances.Existing(ctx, req.UUID, shared.InstanceID, req.AccessType); res != nil {
 			return res, nil
 		}
 		d.log.WarnContext(ctx, "기록된 공유 인스턴스가 살아있지 않음, 다시 만듭니다",
 			"code", code, "instanceId", shared.InstanceID)
 	}
 
-	res := d.instances.Create(ctx, req)
+	// SHARED는 항상 HTTP다(TCP+SHARED는 parser가 막는다). 포트 풀을 안 쓰므로 0.
+	res := d.instances.Create(ctx, req, 0)
 	if res.Status != protocol.StatusReady {
 		return res, nil
 	}
