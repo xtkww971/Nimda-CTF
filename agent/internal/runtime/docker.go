@@ -56,7 +56,14 @@ type RunSpec struct {
 
 // 재시작 시 포트 풀을 다시 계산할 때 쓴다(이슈 #29의 InitPortPool).
 // nimda.ctf.port 라벨이 붙은 컨테이너의 포트를 모은다.
-const labelPort = labelMarker + ".port"
+const LabelPort = labelMarker + ".port"
+
+// reaper가 orphan(registry 기록이 없는 컨테이너)을 회수할 때 보는 라벨들(ADR-0014).
+// handler가 컨테이너를 띄울 때 붙이고, reaper가 읽는다.
+const (
+	LabelUUID    = labelMarker + ".uuid"
+	LabelExpires = labelMarker + ".expires" // RFC3339 만료 시각
+)
 
 type Docker struct {
 	cli  *client.Client
@@ -130,7 +137,7 @@ func (d *Docker) Run(ctx context.Context, imageTag, name string, env, labels map
 		for k, v := range labels {
 			runLabels[k] = v
 		}
-		runLabels[labelPort] = strconv.Itoa(spec.HostPort)
+		runLabels[LabelPort] = strconv.Itoa(spec.HostPort)
 	}
 
 	cfg := &container.Config{
@@ -273,7 +280,7 @@ func (d *Docker) UsedPorts(ctx context.Context) ([]int, error) {
 	}
 	ports := make([]int, 0, len(list))
 	for _, c := range list {
-		raw, ok := c.Labels[labelPort]
+		raw, ok := c.Labels[LabelPort]
 		if !ok {
 			continue
 		}
