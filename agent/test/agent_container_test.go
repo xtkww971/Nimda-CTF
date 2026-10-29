@@ -60,12 +60,17 @@ func TestAgentBuildsRunsAndIsReachable(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// A unique code -> unique image/container name, so runs don't collide.
-	code := fmt.Sprintf("agenttest%d", time.Now().Unix())
+	// code를 길게 잡아 컨테이너 이름이 63자(DNS 라벨 한계)를 넘게 만든다(#39).
+	// 그래도 web은 짧은 alias로 붙어야 한다.
+	code := fmt.Sprintf("web-instance-long-code-test-%d", time.Now().Unix())
 	image := "ctf-chal-" + code + ":latest"
 	// 웹이 사용자·문제마다 발급하는 값 자리. PER_USER 컨테이너 이름의 구분자가 된다.
 	uuid := fmt.Sprintf("uuid-%d", time.Now().UnixNano())
-	name := "ctf-" + code + "-" + uuid // PER_USER 컨테이너 이름 = web 접속 host
+	name := "ctf-" + code + "-" + uuid         // PER_USER 컨테이너 이름
+	alias := runtime.AliasPerUserPrefix + uuid // web이 실제로 붙는 짧은 이름(#39)
+	if len(name) <= 63 {
+		t.Fatalf("이 테스트는 컨테이너 이름이 63자를 넘어야 의미가 있다: %d자 (%s)", len(name), name)
+	}
 	t.Cleanup(func() {
 		bg := context.Background()
 		_ = rt.Remove(bg, name)
@@ -90,9 +95,9 @@ func TestAgentBuildsRunsAndIsReachable(t *testing.T) {
 	if res.Status != protocol.StatusReady {
 		t.Fatalf("status = %q, want READY (message=%q)", res.Status, res.Message)
 	}
-	// web은 컨테이너 이름을 host로, 컨테이너가 EXPOSE한 포트(8080)를 포트로 돌려준다.
-	if res.Host != name {
-		t.Fatalf("web host가 컨테이너 이름이 아님: got %q want %q", res.Host, name)
+	// web은 짧은 alias를 host로, 컨테이너가 EXPOSE한 포트(8080)를 포트로 돌려준다(#39).
+	if res.Host != alias {
+		t.Fatalf("web host가 alias가 아님: got %q want %q", res.Host, alias)
 	}
 	if res.Port != 8080 {
 		t.Fatalf("web 포트가 EXPOSE 포트(8080)가 아님: %d", res.Port)
@@ -120,6 +125,16 @@ func TestAgentBuildsRunsAndIsReachable(t *testing.T) {
 	status := handler.Status(ctx, &protocol.StatusRequest{UUID: uuid, InstanceID: res.InstanceID})
 	if status == nil || status.State != protocol.StateRunning {
 		t.Fatalf("status가 RUNNING이 아님: %+v", status)
+	}
+
+	// ── Existing (재배달/중복 요청) ─────────────────────────────────────
+	// 이미 떠 있는 web 인스턴스를 다시 돌려줄 때도 host가 같은 alias여야 한다(#39).
+	ex := handler.Existing(ctx, uuid, res.InstanceID, protocol.AccessHTTP)
+	if ex == nil || ex.Host != alias {
+		t.Fatalf("Existing host가 alias와 다름: %+v (want host=%q)", ex, alias)
+	}
+	if ex.Port != 8080 {
+		t.Fatalf("Existing 포트가 EXPOSE 포트(8080)가 아님: %+v", ex)
 	}
 
 	// ── Destroy ─────────────────────────────────────────────────────────
