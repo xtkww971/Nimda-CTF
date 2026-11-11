@@ -18,7 +18,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 COMPOSE_FILE=docker-compose.prod.yml
-APP_SERVICES=(agent provisioner dashboard)
+APP_SERVICES=(agent provisioner dashboard instance-gateway)
 STATE_FILE=.deploy_state
 LOG_FILE=deployment.log
 HEALTH_TIMEOUT=90   # 초. agent는 redis 대기 + 포트 풀 계산 뒤에 ready를 찍는다.
@@ -67,6 +67,7 @@ all_ok() {
   container_ok ctf-agent "agent ready" \
     && container_ok ctf-provisioner "provisioner ready" \
     && container_ok ctf-dashboard "" \
+    && container_ok ctf-instance-gateway "" \
     && curl -fsS -o /dev/null --max-time 3 http://127.0.0.1:6070/
 }
 
@@ -83,7 +84,7 @@ wait_healthy() {
 }
 
 dump_logs() {
-  for c in ctf-agent ctf-provisioner ctf-dashboard; do
+  for c in ctf-agent ctf-provisioner ctf-dashboard ctf-instance-gateway; do
     log "--- $c (최근 30줄)"
     docker logs --tail 30 "$c" 2>&1 | tee -a "$LOG_FILE" || true
   done
@@ -103,6 +104,17 @@ release() {
 
   log "[3/4] 앱 컨테이너 교체"
   compose up -d --no-deps "${APP_SERVICES[@]}"
+
+  # 게이트웨이 설정 파일(instance-gateway/nginx.conf)만 바뀌면 compose는 컨테이너를 다시 만들지 않는다.
+  # 검사 후 reload해서 새 설정을 읽게 한다. 검사가 실패하면 기존 설정이 그대로 돌고 배포는 실패로 끝난다.
+  # 설정은 폴더 mount(/etc/nginx/gw)라 -c로 경로를 같이 넘긴다. 기본 경로(/etc/nginx/nginx.conf)는 이미지 기본값이다.
+  local gw_conf=/etc/nginx/gw/nginx.conf
+  if docker exec ctf-instance-gateway nginx -t -c "$gw_conf" >/dev/null 2>&1; then
+    docker exec ctf-instance-gateway nginx -s reload -c "$gw_conf" >/dev/null
+  else
+    docker exec ctf-instance-gateway nginx -t -c "$gw_conf" 2>&1 | tee -a "$LOG_FILE" || true
+    return 1
+  fi
 
   log "[4/4] 헬스체크 (최대 ${HEALTH_TIMEOUT}s + 안정화 ${STABLE_SECONDS}s)"
   wait_healthy

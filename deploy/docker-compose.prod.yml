@@ -91,6 +91,27 @@ services:
     networks:
       - ctf-internal
 
+  # web 인스턴스 포워딩 게이트웨이 (ADR-0023). 웹 backend(Lightsail)가 VPC peering으로 붙는다.
+  # 판정은 하지 않는다. X-Ctf-Target(alias:port) 형식만 보고 ctf-instances로 넘긴다.
+  # EC2 사설 IP에만 바인딩한다. 보안 그룹은 8088을 Lightsail 사설 IP만 허용한다(RB-0003).
+  instance-gateway:
+    <<: *restart
+    image: nginx:1.27-alpine
+    container_name: ctf-instance-gateway
+    mem_limit: 64m
+    ports:
+      - "${CTF_GATEWAY_BIND:?CTF_GATEWAY_BIND must be set in .env}:8088:8088"
+    # 파일 하나가 아니라 폴더를 mount한다. CI의 scp는 tar로 풀면서 파일을 새로 만들어(inode가 바뀐다)
+    # 단일 파일 bind mount는 옛 inode를 계속 보고 있어서 reload해도 새 설정을 못 읽는다.
+    command: ["nginx", "-c", "/etc/nginx/gw/nginx.conf", "-g", "daemon off;"]
+    volumes:
+      - ./instance-gateway:/etc/nginx/gw:ro
+    networks:
+      # 인스턴스 alias를 풀려고 붙는다. internal 망이라 이것만으로는 포트를 열 수 없다.
+      - ctf-instances
+      # 포트 공개용 일반 bridge. 다른 컨테이너는 이 망에 없다.
+      - ctf-gateway
+
   # 127.0.0.1에만 연다. ssh -L 6070:127.0.0.1:6070 <user>@<EC2> 로 본다.
   dashboard:
     <<: *restart
@@ -113,6 +134,8 @@ volumes:
 
 networks:
   ctf-internal:
+  # 게이트웨이 포트 공개 전용 (ADR-0023). internal 망(ctf-instances)에만 붙은 컨테이너는 포트를 못 연다.
+  ctf-gateway:
   # 둘 다 agent가 도커 소켓으로 문제 컨테이너를 붙이는 망이다. 옵션(icc 끄기, internal)과
   # 방화벽이 같이 가야 해서 compose가 만들지 않는다. docs/runbook RB-0001, RB-0002로 미리 만든다.
   ctf-pwn:

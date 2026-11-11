@@ -100,7 +100,7 @@ jobs:
           host: ${{ secrets.CTF_SERVER_HOST }}
           username: ${{ secrets.CTF_SERVER_USER }}
           key: ${{ secrets.CTF_SERVER_SSH_KEY }}
-          source: "deploy/docker-compose.prod.yml,deploy/deploy.sh,deploy/.env.example"
+          source: "deploy/docker-compose.prod.yml,deploy/deploy.sh,deploy/.env.example,deploy/instance-gateway/nginx.conf"
           target: ${{ env.DEPLOY_DIR }}
           strip_components: 1
 
