@@ -72,6 +72,12 @@ type Config struct {
 
 	// presigned URL 유효 시간. 링크가 새어나가도 금방 죽도록 짧게 잡는다.
 	PresignTTL time.Duration
+
+	// 웹 redis에 쓰는 가용성 신호 (ADR-0022). 키는 웹 설정 ctf.queue.heartbeat-key와 같아야 한다.
+	// 한쪽만 바뀌면 웹은 키를 영영 못 찾아서 인스턴스 버튼이 계속 꺼져 있다.
+	HeartbeatKey      string
+	HeartbeatInterval time.Duration
+	HeartbeatTTL      time.Duration
 }
 
 // getter
@@ -157,6 +163,10 @@ func Load() (Config, error) {
 		// 웹 백엔드가 발급된 링크를 10분 캐시해 재사용하므로, 서명 수명은 그보다 넉넉해야
 		// 한다. 짧게 잡으면 캐시에서 꺼낸 링크가 이미 죽어 있을 수 있다.
 		PresignTTL: getEnvDuration("CTF_PRESIGN_TTL", 15*time.Minute),
+
+		HeartbeatKey:      getEnv("CTF_HEARTBEAT_KEY", "ctf:server:heartbeat"),
+		HeartbeatInterval: getEnvDuration("CTF_HEARTBEAT_INTERVAL", 10*time.Second),
+		HeartbeatTTL:      getEnvDuration("CTF_HEARTBEAT_TTL", 30*time.Second),
 	}
 
 	if cfg.MaxDeliveries < 1 {
@@ -167,6 +177,12 @@ func Load() (Config, error) {
 	// 사실상 영구 공개 URL이 되므로 상한을 둔다. (S3 SigV4 자체 상한은 7일)
 	if cfg.PresignTTL <= 0 || cfg.PresignTTL > time.Hour {
 		return Config{}, fmt.Errorf("CTF_PRESIGN_TTL must be in (0, 1h], got %s", cfg.PresignTTL)
+	}
+
+	// TTL이 주기보다 짧으면 쓰는 사이사이에 키가 비어서 웹 버튼이 깜빡인다.
+	if cfg.HeartbeatInterval <= 0 || cfg.HeartbeatTTL <= cfg.HeartbeatInterval {
+		return Config{}, fmt.Errorf("CTF_HEARTBEAT_TTL(%s) must be greater than CTF_HEARTBEAT_INTERVAL(%s) > 0",
+			cfg.HeartbeatTTL, cfg.HeartbeatInterval)
 	}
 
 	return cfg, nil

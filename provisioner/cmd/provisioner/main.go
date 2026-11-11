@@ -13,10 +13,12 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	protocol "nimda-ctf-protocol"
 	"nimda-judge-provisioner/internal/agentclient"
 	"nimda-judge-provisioner/internal/aws"
 	"nimda-judge-provisioner/internal/config"
 	"nimda-judge-provisioner/internal/handler"
+	"nimda-judge-provisioner/internal/heartbeat"
 	"nimda-judge-provisioner/internal/queue"
 )
 
@@ -115,6 +117,14 @@ func main() {
 		"stream", cfg.AgentResultStreamKey(), "group", cfg.AgentConsumerGroup(),
 		"resultStream", cfg.ResultStreamKey())
 	go agentResults.Run(ctx)
+
+	// 웹에 "요청을 받을 수 있다"는 신호를 남긴다. agent snapshot이 있을 때만 쓴다 (ADR-0022).
+	go heartbeat.New(rdb, agentRdb, heartbeat.Options{
+		Key:      cfg.HeartbeatKey,
+		Interval: cfg.HeartbeatInterval,
+		TTL:      cfg.HeartbeatTTL,
+		AgentKey: protocol.MonitorSnapshotKey,
+	}, logger).Run(ctx)
 
 	logger.Info("provisioner ready, consuming queue")
 	consumer.Run(ctx)
