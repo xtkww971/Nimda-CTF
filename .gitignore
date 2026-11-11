@@ -1,2 +1,8 @@
 ﻿debuging tool for window/JudgeServer/.env
 *.env
+# SSH 개인키·인증서. 레포에 올라가면 서버 접근 권한이 그대로 샌다.
+*.pem
+*.key
+# deploy.sh가 서버 배포 폴더에 남기는 상태·로그
+.deploy_state
+deployment.log

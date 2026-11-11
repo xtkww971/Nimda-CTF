@@ -1,0 +1,117 @@
+name: CTF CI/CD
+
+# main에 들어오면 이미지 3개(agent·provisioner·dashboard)를 Docker Hub에 올리고 EC2에 배포한다.
+# 웹 백엔드(nimda-web-backend/.github/workflows/ci.yml)와 같은 흐름이다.
+#   빌드 검사 → 이미지 push(:latest, :<short sha>) → deploy 폴더 scp → ssh로 deploy.sh <sha>
+#
+# 서버 시크릿 이름에 CTF_ 를 붙인 이유: 같은 org(Nimda-Security)에 웹 백엔드의 SERVER_HOST가
+# org 시크릿으로 있으면 그 값을 받아 Lightsail에 CTF를 배포해 버릴 수 있다.
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "agent/**"
+      - "provisioner/**"
+      - "dashboard/**"
+      - "protocol/**"
+      - "deploy/**"
+      - ".github/workflows/ctf-cd.yml"
+  workflow_dispatch:
+
+# 배포가 겹치면 deploy.sh 두 개가 같은 컨테이너를 동시에 만진다. 앞의 것이 끝날 때까지 기다린다.
+concurrency:
+  group: ctf-deploy
+  cancel-in-progress: false
+
+env:
+  DEPLOY_DIR: /home/ubuntu/ctf
+  # EC2가 Graviton(t4g 등)이면 linux/arm64로 바꾼다.
+  PLATFORMS: linux/amd64
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [ protocol, agent, provisioner, dashboard ]
+    env:
+      # Dockerfile과 같게 모듈 단위로 빌드한다 (replace로 protocol을 참조).
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+      - name: build & vet
+        working-directory: ${{ matrix.module }}
+        run: |
+          go build ./...
+          go vet ./...
+
+  build-and-push:
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [ agent, provisioner, dashboard ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 깃 해시 추출
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 도커허브 로그인
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+
+      # 빌드 컨텍스트는 레포 루트다 (Dockerfile이 protocol/을 같이 COPY한다).
+      - name: 이미지 빌드 및 푸시
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./${{ matrix.component }}/Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_HUB_USERNAME }}/nimda-ctf-${{ matrix.component }}:latest
+            ${{ secrets.DOCKER_HUB_USERNAME }}/nimda-ctf-${{ matrix.component }}:${{ steps.vars.outputs.sha_short }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 깃 해시 추출
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: 배포 파일 전송
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.CTF_SERVER_HOST }}
+          username: ${{ secrets.CTF_SERVER_USER }}
+          key: ${{ secrets.CTF_SERVER_SSH_KEY }}
+          source: "deploy/docker-compose.prod.yml,deploy/deploy.sh,deploy/.env.example"
+          target: ${{ env.DEPLOY_DIR }}
+          strip_components: 1
+
+      - name: EC2 배포
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.CTF_SERVER_HOST }}
+          username: ${{ secrets.CTF_SERVER_USER }}
+          key: ${{ secrets.CTF_SERVER_SSH_KEY }}
+          command_timeout: 15m
+          script: |
+            cd ${{ env.DEPLOY_DIR }}
+            chmod +x deploy.sh
+            ./deploy.sh ${{ steps.vars.outputs.sha_short }}

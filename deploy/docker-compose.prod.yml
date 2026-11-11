@@ -1,0 +1,121 @@
+# CTF 서버(EC2) 운영용 compose. CI가 deploy.sh와 함께 서버의 배포 폴더로 보낸다.
+#
+# 루트의 docker-compose.yml(로컬·단일 호스트용)과 다른 점:
+#   * build 대신 Docker Hub 이미지를 받는다. 태그는 deploy.sh가 CTF_IMAGE_TAG로 넘긴다.
+#   * nimda-network(웹 망)에 붙지 않는다. 웹 백엔드는 Lightsail, CTF는 EC2라 다른 호스트다.
+#     provisioner는 nimda-redis를 컨테이너 이름이 아니라 주소(REDIS_ADDR)로 찾는다.
+#   * 비밀값은 같은 폴더의 .env(서버에만 존재, 레포에 없음)에서 보간한다. env_file로 통째로
+#     넣지 않고 서비스마다 필요한 것만 나열한다. agent에 AWS 키가 들어갈 이유가 없다.
+#   * CONSUMER_NAME을 고정한다. 기본값(hostname-pid)은 컨테이너를 새로 만들 때마다 바뀌어서
+#     재배포할 때마다 consumer group에 죽은 consumer가 하나씩 쌓인다.
+
+name: nimda-ctf
+
+x-common: &restart
+  restart: unless-stopped
+
+services:
+  # 상태(인스턴스 기록, 포트 풀, lease)가 전부 여기 있다. 영속화를 끈 통이라 컨테이너를
+  # 다시 만들면 상태가 사라진다. 그래서 deploy.sh는 이 서비스를 pull/재생성하지 않는다.
+  ctf-redis:
+    <<: *restart
+    image: redis:7-alpine
+    container_name: ctf-redis
+    mem_limit: 100m
+    command: >
+      redis-server
+      --maxmemory 80mb
+      --maxmemory-policy noeviction
+      --save ""
+      --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ctf-internal
+
+  agent:
+    <<: *restart
+    image: ${CTF_IMAGE_NAMESPACE:-xtkww971}/nimda-ctf-agent:${CTF_IMAGE_TAG:-latest}
+    container_name: ctf-agent
+    environment:
+      - TZ=Asia/Seoul
+      - CONSUMER_NAME=ctf-agent-1
+      - CTF_BUILD_WORK_DIR=/var/lib/ctf/build
+      # 참가자에게 보여줄 주소. EC2의 고정 IP(Elastic IP) 또는 그 도메인.
+      - CTF_INSTANCE_HOST=${CTF_PUBLIC_HOST:?CTF_PUBLIC_HOST must be set in .env}
+      - CTF_PWN_PUBLIC_HOST=${CTF_PUBLIC_HOST}
+      - CTF_PWN_PORT_RANGE=${CTF_PWN_PORT_RANGE:-30000-30199}
+      - CTF_PWN_NETWORK=ctf-pwn
+      - CTF_INSTANCE_NETWORK=ctf-instances
+      # "" = 기본 런타임. gVisor를 깔면 runsc (ADR-0008 예정).
+      - CTF_CONTAINER_RUNTIME=${CTF_CONTAINER_RUNTIME:-}
+      - CTF_AGENT_REDIS_ADDR=ctf-redis:6379
+      - CTF_QUEUE_AGENT_STREAM_KEY=ctf:agent:ops
+      - CTF_QUEUE_AGENT_CONSUMER_GROUP=ctf-agents
+      - CTF_QUEUE_AGENT_RESULT_STREAM_KEY=ctf:agent:results
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ctf-build:/var/lib/ctf/build
+    depends_on:
+      ctf-redis:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+
+  provisioner:
+    <<: *restart
+    image: ${CTF_IMAGE_NAMESPACE:-xtkww971}/nimda-ctf-provisioner:${CTF_IMAGE_TAG:-latest}
+    container_name: ctf-provisioner
+    environment:
+      - TZ=Asia/Seoul
+      - CONSUMER_NAME=ctf-provisioner-1
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      # 웹(Lightsail)의 nimda-redis. 다른 호스트라 주소:포트로 붙는다.
+      - REDIS_ADDR=${WEB_REDIS_ADDR:?WEB_REDIS_ADDR must be set in .env}
+      - REDIS_PASSWORD=${WEB_REDIS_PASSWORD:?WEB_REDIS_PASSWORD must be set in .env}
+      - REDIS_DB=${WEB_REDIS_DB:-0}
+      - CTF_AGENT_REDIS_ADDR=ctf-redis:6379
+      - CTF_BUILD_WORK_DIR=/var/lib/ctf/build
+      - AWS_S3_REGION=${AWS_S3_REGION:-ap-northeast-2}
+      - AWS_S3_BUCKET=${AWS_S3_BUCKET:?AWS_S3_BUCKET must be set in .env}
+      - AWS_S3_ACCESS_KEY=${AWS_S3_ACCESS_KEY:?AWS_S3_ACCESS_KEY must be set in .env}
+      - AWS_S3_SECRET_KEY=${AWS_S3_SECRET_KEY:?AWS_S3_SECRET_KEY must be set in .env}
+    volumes:
+      - ctf-build:/var/lib/ctf/build
+    depends_on:
+      ctf-redis:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+
+  # 127.0.0.1에만 연다. ssh -L 6070:127.0.0.1:6070 <user>@<EC2> 로 본다.
+  dashboard:
+    <<: *restart
+    image: ${CTF_IMAGE_NAMESPACE:-xtkww971}/nimda-ctf-dashboard:${CTF_IMAGE_TAG:-latest}
+    container_name: ctf-dashboard
+    environment:
+      - TZ=Asia/Seoul
+      - CTF_DASHBOARD_ADDR=:6070
+      - CTF_DASHBOARD_REDIS_ADDR=ctf-redis:6379
+    ports:
+      - "127.0.0.1:6070:6070"
+    depends_on:
+      ctf-redis:
+        condition: service_healthy
+    networks:
+      - ctf-internal
+
+volumes:
+  ctf-build:
+
+networks:
+  ctf-internal:
+  # 둘 다 agent가 도커 소켓으로 문제 컨테이너를 붙이는 망이다. 옵션(icc 끄기, internal)과
+  # 방화벽이 같이 가야 해서 compose가 만들지 않는다. docs/runbook RB-0001, RB-0002로 미리 만든다.
+  ctf-pwn:
+    external: true
+  ctf-instances:
+    external: true
