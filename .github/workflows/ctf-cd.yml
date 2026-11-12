@@ -100,7 +100,7 @@ jobs:
           host: ${{ secrets.CTF_SERVER_HOST }}
           username: ${{ secrets.CTF_SERVER_USER }}
           key: ${{ secrets.CTF_SERVER_SSH_KEY }}
-          source: "deploy/docker-compose.prod.yml,deploy/deploy.sh,deploy/.env.example,deploy/instance-gateway/nginx.conf"
+          source: "deploy/docker-compose.prod.yml,deploy/deploy.sh,deploy/ctf-start.sh,deploy/.env.example,deploy/instance-gateway/nginx.conf"
           target: ${{ env.DEPLOY_DIR }}
           strip_components: 1
 
@@ -113,5 +113,5 @@ jobs:
           command_timeout: 15m
           script: |
             cd ${{ env.DEPLOY_DIR }}
-            chmod +x deploy.sh
+            chmod +x deploy.sh ctf-start.sh
             ./deploy.sh ${{ steps.vars.outputs.sha_short }}
