@@ -6,7 +6,7 @@
 # EC2는 콘솔에서 직접 켠다. 이 스크립트는 AWS를 조작하지 않는다(자격증명 불필요).
 #
 # 껐다 켜면:
-#   * 컨테이너 5개는 restart: unless-stopped라 도커가 뜨면 알아서 다시 뜬다. 보통은 확인만 하고 끝난다.
+#   * 컨테이너 10개는 restart: unless-stopped라 도커가 뜨면 알아서 다시 뜬다. 보통은 확인만 하고 끝난다.
 #   * 공인 IP는 Elastic IP가 아니면 바뀐다. 그러면 pwn 안내 주소(CTF_PUBLIC_HOST)를 고치고 같은 태그로 다시 배포한다.
 #   * ctf-redis는 비어서 뜬다(영속화 꺼짐). 끄기 전 인스턴스 기록은 사라진다.
 #
@@ -15,7 +15,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-EXPECTED="ctf-agent ctf-dashboard ctf-instance-gateway ctf-provisioner ctf-redis"
+EXPECTED="ctf-agent ctf-alloy ctf-dashboard ctf-docker-proxy ctf-grafana ctf-instance-gateway ctf-loki ctf-prometheus ctf-provisioner ctf-redis"
 
 say()  { printf '\033[1;36m▶ %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32m✔ %s\033[0m\n' "$*"; }
@@ -34,7 +34,7 @@ GATEWAY_URL="http://$(env_get CTF_GATEWAY_BIND):8088/"
 # 하나도 안 떠 있으면 grep이 1로 끝난다. pipefail 때문에 그대로 두면 복구 단계 전에 스크립트가 죽는다.
 running_set() {
   { docker ps --format '{{.Names}}' 2>/dev/null \
-      | grep -E '^ctf-(agent|dashboard|instance-gateway|provisioner|redis)$' || true; } \
+      | grep -E '^ctf-(agent|alloy|dashboard|docker-proxy|grafana|instance-gateway|loki|prometheus|provisioner|redis)$' || true; } \
     | sort | tr '\n' ' ' | sed 's/ $//'
 }
 
@@ -85,7 +85,7 @@ if [ -n "$IP_CHANGED" ] || [ "$NOW" != "$EXPECTED" ]; then
   fi
   ./deploy.sh "$TAG" || die "deploy.sh가 실패했습니다. deployment.log를 확인하세요."
 else
-  ok "컨테이너 5개 모두 실행 중"
+  ok "컨테이너 10개 모두 실행 중"
 fi
 
 # ---------------------------------------------------------------- 4. 점검
@@ -94,10 +94,19 @@ FAILS=0
 pass() { printf '  \033[32mOK\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILS=$((FAILS + 1)); }
 
-for c in ctf-redis ctf-agent ctf-provisioner ctf-dashboard ctf-instance-gateway; do
+for c in ctf-redis ctf-agent ctf-provisioner ctf-dashboard ctf-instance-gateway ctf-docker-proxy ctf-alloy ctf-loki ctf-prometheus ctf-grafana; do
   s=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)
   if [ "$s" = running ]; then pass "$c"; else fail "$c ($s)"; fi
 done
+
+# 모니터링 데이터 볼륨(ADR-0024, RB-0004). fstab의 nofail 때문에 볼륨이 안 붙어도 부팅은 된다.
+# 그 상태로 두면 데이터가 루트 디스크의 빈 디렉터리에 쌓이고 지난 기록이 안 보인다.
+MON_DIR=$(env_get MONITORING_DATA_DIR); MON_DIR=${MON_DIR:-/var/lib/monitoring}
+if mountpoint -q "$MON_DIR"; then
+  pass "모니터링 볼륨 $MON_DIR ($(df -h --output=pcent "$MON_DIR" | tail -1 | tr -d ' ') 사용)"
+else
+  fail "모니터링 볼륨이 $MON_DIR 에 마운트되지 않음 (RB-0004 단계 1)"
+fi
 
 if docker network inspect ctf-pwn >/dev/null 2>&1 && docker network inspect ctf-instances >/dev/null 2>&1; then
   pass "망 ctf-pwn, ctf-instances"

@@ -49,8 +49,16 @@ jobs:
           go build ./...
           go vet ./...
 
+  # 수집기 설정(ADR-0024) 문법 검사. 틀린 설정이 배포되면 alloy가 재시작을 반복한다.
+  alloy-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: alloy fmt
+        run: docker run --rm -v "$PWD/deploy/alloy:/etc/alloy:ro" grafana/alloy:v1.10.2 fmt /etc/alloy/config.alloy > /dev/null
+
   build-and-push:
-    needs: verify
+    needs: [ verify, alloy-config ]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -100,7 +108,7 @@ jobs:
           host: ${{ secrets.CTF_SERVER_HOST }}
           username: ${{ secrets.CTF_SERVER_USER }}
           key: ${{ secrets.CTF_SERVER_SSH_KEY }}
-          source: "deploy/docker-compose.prod.yml,deploy/deploy.sh,deploy/ctf-start.sh,deploy/.env.example,deploy/instance-gateway/nginx.conf"
+          source: "deploy/docker-compose.prod.yml,deploy/deploy.sh,deploy/ctf-start.sh,deploy/.env.example,deploy/instance-gateway/nginx.conf,deploy/alloy/config.alloy,deploy/monitoring"
           target: ${{ env.DEPLOY_DIR }}
           strip_components: 1
 
