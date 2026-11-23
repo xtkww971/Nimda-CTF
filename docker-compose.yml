@@ -88,12 +88,122 @@ services:
     networks:
       - ctf-internal
 
+  # ---- 로그·메트릭 (ADR-0024). 기본으로는 뜨지 않는다. ----
+  #   docker compose --profile monitoring up -d     → Grafana: http://localhost:3000 (admin / admin)
+  # 운영과 같은 설정 파일(deploy/alloy, deploy/monitoring)을 쓴다. 설명은 deploy/docker-compose.prod.yml에 있다.
+  # 로컬은 데이터를 이름 있는 볼륨에 둔다(운영은 별도 EBS 볼륨).
+  docker-proxy:
+    profiles: ["monitoring"]
+    image: tecnativa/docker-socket-proxy:v0.4.1
+    container_name: ctf-docker-proxy
+    environment:
+      - CONTAINERS=1
+      - INFO=1
+      - NETWORKS=1
+      - POST=0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - ctf-observe
+
+  alloy:
+    profiles: ["monitoring"]
+    image: grafana/alloy:v1.10.2
+    container_name: ctf-alloy
+    cpus: "0.5"
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy/data
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --disable-reporting
+    environment:
+      - MONITORING_LOKI_URL=http://loki:3100/loki/api/v1/push
+      - MONITORING_PROMETHEUS_URL=http://prometheus:9090/api/v1/write
+      - MONITORING_HOST_LABEL=local
+    ports:
+      - "127.0.0.1:12345:12345"
+    volumes:
+      - ./deploy/alloy:/etc/alloy:ro
+      - alloy-data:/var/lib/alloy/data
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      # Docker Desktop의 / 는 shared mount가 아니라 rslave를 못 붙인다. 운영(Linux)은 rslave를 쓴다.
+      - /:/host/root:ro
+      - /sys:/sys:ro
+    depends_on:
+      - docker-proxy
+    networks:
+      - ctf-internal
+      - ctf-observe
+      - ctf-monitoring
+
+  loki:
+    profiles: ["monitoring"]
+    image: grafana/loki:3.5.3
+    container_name: ctf-loki
+    command: ["-config.file=/etc/loki/config.yaml", "-config.expand-env=true"]
+    volumes:
+      - ./deploy/monitoring/loki:/etc/loki:ro
+      - loki-data:/loki
+    networks:
+      - ctf-monitoring
+
+  prometheus:
+    profiles: ["monitoring"]
+    image: prom/prometheus:v3.5.0
+    container_name: ctf-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./deploy/monitoring/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    networks:
+      - ctf-monitoring
+
+  grafana:
+    profiles: ["monitoring"]
+    image: grafana/grafana:12.1.1
+    container_name: ctf-grafana
+    environment:
+      # 로컬 전용(127.0.0.1에만 열림). 운영은 .env의 GRAFANA_ADMIN_PASSWORD가 필수다.
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+      - GF_NEWS_NEWS_FEED_ENABLED=false
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./deploy/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - ctf-monitoring
+      - ctf-grafana
+
 volumes:
   ctf-build:
+  alloy-data:
+  loki-data:
+  prometheus-data:
+  grafana-data:
 
 networks:
   # ctf 서버 내부 컨테이너 네트워크
   ctf-internal:
+
+  # 수집기와 Docker API 프록시만 있는 망 (ADR-0024)
+  ctf-observe:
+
+  # 수집기·Loki·Prometheus·Grafana 망 (ADR-0024). internal이라 밖으로 못 나간다.
+  ctf-monitoring:
+    internal: true
+
+  # Grafana 포트 공개 전용
+  ctf-grafana:
 
   # 웹사이트 컨테이너 네트워크
   nimda-network:
