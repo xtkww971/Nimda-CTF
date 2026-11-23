@@ -1,0 +1,20 @@
+# Prometheus 설정 (ADR-0024).
+#
+# CTF EC2의 메트릭은 같은 호스트의 Alloy가 remote_write로 밀어 넣는다(--web.enable-remote-write-receiver).
+# 여기서 직접 긁는 건 Prometheus 자신과 Loki뿐이다.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+        labels:
+          host: ctf-ec2
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+        labels:
+          host: ctf-ec2

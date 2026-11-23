@@ -1,0 +1,64 @@
+# Loki 단일 바이너리 설정 (ADR-0024). CTF EC2 안에서 돌고, 파일시스템(별도 EBS 볼륨)에 저장한다.
+# -config.expand-env=true로 띄워서 ${VAR:-기본값}이 환경변수로 풀린다(docker-compose.prod.yml).
+
+# 인증이 없다. 포트를 호스트에 열지 않고 ctf-monitoring 망의 Alloy·Grafana만 닿는다.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2026-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # 보관 기간은 실제 시각 기준이다. EC2를 꺼 둔 동안에도 흘러가서, 켜는 순간 이보다 오래된 로그가 지워진다.
+  # 대회·테스트 때만 켜는 서버라 길게 잡는다. Loki에는 크기 기준 삭제가 없으니 볼륨 사용량은 대시보드로 본다.
+  retention_period: ${LOKI_RETENTION_PERIOD:-4320h} # 기본 180일
+  # 문제 컨테이너는 참가자가 출력을 정한다. Alloy에서 먼저 자르지만(config.alloy의 stage.limit)
+  # 그걸 뚫고 와도 인스턴스 하나가 Loki 전체를 채우지 못하게 스트림 단위로 한 번 더 막는다.
+  ingestion_rate_mb: 4
+  ingestion_burst_size_mb: 8
+  per_stream_rate_limit: 512KB
+  per_stream_rate_limit_burst: 2MB
+  max_line_size: 64KB
+  max_line_size_truncate: true
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  allow_structured_metadata: true
+  volume_enabled: true
+  max_query_series: 1000
+
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 2h
+  delete_request_store: filesystem
+
+# Grafana의 Logs Drilldown(패턴 보기)에 쓰인다.
+pattern_ingester:
+  enabled: true
+
+analytics:
+  reporting_enabled: false
