@@ -18,7 +18,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 COMPOSE_FILE=docker-compose.prod.yml
-APP_SERVICES=(agent provisioner dashboard instance-gateway)
+APP_SERVICES=(agent provisioner dashboard instance-gateway docker-proxy alloy loki prometheus grafana)
+MONITORING_CONTAINERS=(ctf-alloy ctf-loki ctf-prometheus ctf-grafana)
 STATE_FILE=.deploy_state
 LOG_FILE=deployment.log
 HEALTH_TIMEOUT=90   # 초. agent는 redis 대기 + 포트 풀 계산 뒤에 ready를 찍는다.
@@ -45,6 +46,18 @@ preflight() {
     || die "ctf-pwn 네트워크가 없습니다. docs/runbook/[RB-0001] 을 먼저 수행하세요."
   docker network inspect ctf-instances >/dev/null 2>&1 \
     || die "ctf-instances 네트워크가 없습니다. docs/runbook/[RB-0002] 를 먼저 수행하세요."
+
+  # 모니터링 데이터 디렉터리(ADR-0024). 없으면 도커가 root 소유로 만들어 Loki·Prometheus·Grafana가
+  # 쓰기 권한 없이 재시작을 반복한다. 소유자까지 맞춰야 해서 여기서 만들지 않는다.
+  local mon_dir
+  mon_dir=$({ grep -E '^MONITORING_DATA_DIR=' .env || true; } | head -1 | cut -d= -f2-)
+  mon_dir=${mon_dir:-/var/lib/monitoring}
+  for d in loki prometheus grafana; do
+    [ -d "$mon_dir/$d" ] || die "$mon_dir/$d 가 없습니다. docs/runbook/[RB-0004] 단계 2를 먼저 수행하세요."
+  done
+  # 별도 볼륨이 아니면 모니터링 데이터가 루트 디스크(도커와 같은 디스크)에 쌓인다. 막지는 않는다.
+  mountpoint -q "$mon_dir" 2>/dev/null \
+    || log "⚠️ $mon_dir 가 별도 볼륨이 아닙니다. 모니터링 데이터가 루트 디스크에 쌓입니다(RB-0004 단계 1)."
 
   # 문법·필수 변수(:?) 검사. 비밀값이 출력되지 않게 결과는 버린다.
   compose config -q || die "compose 설정 검사 실패 (.env 필수 값 누락 가능)."
@@ -84,7 +97,7 @@ wait_healthy() {
 }
 
 dump_logs() {
-  for c in ctf-agent ctf-provisioner ctf-dashboard ctf-instance-gateway; do
+  for c in ctf-agent ctf-provisioner ctf-dashboard ctf-instance-gateway "${MONITORING_CONTAINERS[@]}"; do
     log "--- $c (최근 30줄)"
     docker logs --tail 30 "$c" 2>&1 | tee -a "$LOG_FILE" || true
   done
@@ -116,8 +129,22 @@ release() {
     return 1
   fi
 
+  # alloy·loki·prometheus는 설정 파일을 처음 뜰 때만 읽는다. 파일만 바뀌면 compose가 다시 만들지 않으니
+  # 매번 재시작한다. 데이터와 Alloy의 전송 버퍼는 볼륨에 있어 재시작해도 이어진다.
+  # Grafana는 대시보드 파일을 30초마다 다시 읽으므로 재시작하지 않는다.
+  # 실패해도 CTF와 무관하니 배포를 멈추지 않는다.
+  compose restart loki prometheus alloy >/dev/null \
+    || log "⚠️ 모니터링 컨테이너 재시작 실패. 새 설정이 반영되지 않았을 수 있습니다."
+
   log "[4/4] 헬스체크 (최대 ${HEALTH_TIMEOUT}s + 안정화 ${STABLE_SECONDS}s)"
-  wait_healthy
+  wait_healthy || return 1
+
+  # 모니터링은 CTF 동작과 무관하다. 죽어 있어도 배포를 실패로 돌리지 않고 경고만 남긴다(ADR-0024).
+  local c
+  for c in "${MONITORING_CONTAINERS[@]}"; do
+    container_ok "$c" "" \
+      || log "⚠️ $c 가 정상이 아닙니다. 로그·메트릭 수집이나 대시보드가 멈췄을 수 있습니다: docker logs $c"
+  done
 }
 
 deploy() {
