@@ -13,6 +13,14 @@ name: nimda-ctf
 
 x-common: &restart
   restart: unless-stopped
+  # docker 기본값(json-file)은 로그를 끝없이 쌓는다. 대회 중 디스크가 차지 않게 컨테이너당 30MB로 자른다.
+  # Alloy는 Docker API로 읽어 Loki로 보내므로 여기서 잘려도 수집된 로그는 남는다.
+  # agent가 띄우는 문제 컨테이너는 compose 밖이라 이 설정을 받지 않는다. daemon.json으로 건다(RB-0004).
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
 
 services:
   # 상태(인스턴스 기록, 포트 풀, lease)가 전부 여기 있다. 영속화를 끈 통이라 컨테이너를
@@ -129,11 +137,164 @@ services:
     networks:
       - ctf-internal
 
+  # Alloy에게 docker.sock 대신 주는 읽기 전용 Docker API (ADR-0024).
+  # 소켓을 쥐는 프로세스는 호스트 root와 같다(ADR-0009). 그래서 Alloy에 소켓을 직접 주지 않고
+  # 컨테이너·네트워크 조회, 컨테이너 로그, info만 GET으로 연다. POST(생성·exec·삭제)는 막힌다.
+  # 네트워크 조회(NETWORKS)는 Alloy의 discovery.docker가 컨테이너 망 정보를 읽는 데 필요하다.
+  # 포트를 열지 않고 ctf-observe 망에서 alloy만 붙는다.
+  docker-proxy:
+    <<: *restart
+    image: tecnativa/docker-socket-proxy:v0.4.1
+    container_name: ctf-docker-proxy
+    mem_limit: 64m
+    environment:
+      - CONTAINERS=1
+      - INFO=1
+      - NETWORKS=1
+      - POST=0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - ctf-observe
+
+  # ---------------------------------------------------------------- 로그·메트릭 (ADR-0024)
+  # 수집(Alloy) → 저장(Loki·Prometheus) → 화면(Grafana)이 전부 이 EC2 안에 있다.
+  # 저장 데이터는 루트 디스크가 아니라 별도 EBS 볼륨(MONITORING_DATA_DIR)에 둔다. 모니터링 데이터가
+  # 차도 도커(문제 이미지 빌드·컨테이너)까지 번지지 않고, EC2를 꺼도 남는다(RB-0004).
+  # 이 넷이 죽어도 CTF는 돌아간다. deploy.sh는 이들 상태로 배포 성패를 가르지 않는다.
+
+  # 수집기. 같은 호스트의 Loki·Prometheus로 push한다.
+  alloy:
+    <<: *restart
+    image: grafana/alloy:v1.10.2
+    container_name: ctf-alloy
+    mem_limit: 256m
+    # 문제 컨테이너가 stdout을 쏟으면 Alloy는 읽은 뒤에 버린다(stage.limit). 읽는 비용까지 막지는 못해서
+    # 한 코어를 다 먹을 수 있다. 문제 컨테이너와 CPU를 다투지 않게 반 코어로 묶는다.
+    cpus: "0.5"
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy/data
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --disable-reporting
+    environment:
+      - TZ=Asia/Seoul
+      - MONITORING_LOKI_URL=http://loki:3100/loki/api/v1/push
+      - MONITORING_PROMETHEUS_URL=http://prometheus:9090/api/v1/write
+      - MONITORING_HOST_LABEL=ctf-ec2
+    # Alloy UI(수집 파이프라인 상태). 127.0.0.1에만 연다. ssh -L 12345:127.0.0.1:12345 로 본다.
+    ports:
+      - "127.0.0.1:12345:12345"
+    volumes:
+      # 파일이 아니라 폴더를 mount한다(instance-gateway와 같은 이유: scp가 inode를 바꾼다).
+      - ./alloy:/etc/alloy:ro
+      # 전송 실패 시 버퍼(WAL)와 로그 읽은 위치. 재시작해도 이어서 보낸다.
+      - alloy-data:/var/lib/alloy/data
+      # 호스트 메트릭(node exporter)용. 전부 읽기 전용.
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro,rslave
+      # 컨테이너 메트릭(cAdvisor)용. 도커 cgroup(/sys/fs/cgroup)을 읽는다.
+      - /sys:/sys:ro
+    depends_on:
+      - docker-proxy
+    networks:
+      # ctf-redis 메트릭을 읽으려고 붙는다.
+      - ctf-internal
+      - ctf-observe
+      - ctf-monitoring
+
+  # 로그 저장. 포트를 호스트에 열지 않는다. Alloy(쓰기)와 Grafana(읽기)만 ctf-monitoring 망으로 닿는다.
+  loki:
+    <<: *restart
+    image: grafana/loki:3.5.3
+    container_name: ctf-loki
+    mem_limit: 384m
+    command: ["-config.file=/etc/loki/config.yaml", "-config.expand-env=true"]
+    environment:
+      - LOKI_RETENTION_PERIOD=${LOKI_RETENTION_PERIOD:-4320h}
+    volumes:
+      - ./monitoring/loki:/etc/loki:ro
+      # 이미지의 loki 사용자(uid 10001)가 쓴다. 디렉터리 소유자를 맞춰 둔다(RB-0004).
+      - ${MONITORING_DATA_DIR:-/var/lib/monitoring}/loki:/loki
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3100/ready || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    networks:
+      - ctf-monitoring
+
+  # 메트릭 저장. Alloy가 remote_write로 밀어 넣는다. 포트를 호스트에 열지 않는다.
+  prometheus:
+    <<: *restart
+    image: prom/prometheus:v3.5.0
+    container_name: ctf-prometheus
+    mem_limit: 384m
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 보관 기간은 실제 시각 기준이다. EC2를 꺼 둔 동안에도 흘러간다. 대회·테스트 때만 켜는 서버라 길게 잡고,
+      # 크기 상한으로 볼륨이 차는 걸 막는다(먼저 닿는 쪽으로 오래된 블록부터 지운다).
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-180d}
+      - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-10GB}
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      # 이미지의 nobody 사용자(uid 65534)가 쓴다(RB-0004).
+      - ${MONITORING_DATA_DIR:-/var/lib/monitoring}/prometheus:/prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9090/-/ready || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+    networks:
+      - ctf-monitoring
+
+  # 대시보드. 127.0.0.1에만 연다. ssh -L 3000:127.0.0.1:3000 <user>@<EC2> 로 본다.
+  grafana:
+    <<: *restart
+    image: grafana/grafana:12.1.1
+    container_name: ctf-grafana
+    mem_limit: 192m
+    environment:
+      - TZ=Asia/Seoul
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      # 처음 뜰 때만 쓰인다. 이후 바꾸려면 Grafana UI에서 바꾼다(값은 데이터 볼륨에 저장된다).
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set in .env}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+      - GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false
+      - GF_NEWS_NEWS_FEED_ENABLED=false
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # 이미지의 grafana 사용자(uid 472)가 쓴다(RB-0004).
+      - ${MONITORING_DATA_DIR:-/var/lib/monitoring}/grafana:/var/lib/grafana
+    networks:
+      - ctf-monitoring
+      # 포트 공개용 일반 bridge. ctf-monitoring은 internal이라 그것만으로는 포트를 못 연다.
+      - ctf-grafana
+
 volumes:
   ctf-build:
+  alloy-data:
 
 networks:
   ctf-internal:
+  # 수집기와 Docker API 프록시만 있는 망. 다른 컨테이너는 프록시에 닿지 못한다.
+  ctf-observe:
+  # 수집기·Loki·Prometheus·Grafana만 있는 망. internal이라 밖으로 나가지 못한다.
+  ctf-monitoring:
+    internal: true
+  # Grafana 포트 공개 전용. 다른 컨테이너는 이 망에 없다.
+  ctf-grafana:
   # 게이트웨이 포트 공개 전용 (ADR-0023). internal 망(ctf-instances)에만 붙은 컨테이너는 포트를 못 연다.
   ctf-gateway:
   # 둘 다 agent가 도커 소켓으로 문제 컨테이너를 붙이는 망이다. 옵션(icc 끄기, internal)과

@@ -135,6 +135,21 @@ docker compose up -d --build
 go test ./...
 ```
 
+## 로그·메트릭
+
+CTF 서버의 컨테이너 로그와 호스트·컨테이너·ctf-redis 메트릭을 같은 EC2 안의 Loki·Prometheus·Grafana로 모은다.
+수집은 Grafana Alloy가 하고, 데이터는 별도 EBS 볼륨에 둬서 EC2를 꺼도 남는다(180일 보관).
+설정은 [`deploy/alloy/`](./deploy/alloy)와 [`deploy/monitoring/`](./deploy/monitoring)에 있다.
+배경은 [ADR-0024](<./docs/adr/[ADR-0024] 로그·메트릭 수집 — CTF EC2 안의 Loki·Prometheus·Grafana, 데이터는 별도 EBS 볼륨.md>),
+서버 준비 절차는 [RB-0004](<./docs/runbook/[RB-0004] 모니터링 서버 구성.md>)에 있다.
+
+```bash
+# 로컬에서 시험
+docker compose --profile monitoring up -d
+# Grafana: http://localhost:3000 (admin / admin)
+# 서버: ssh -L 3000:127.0.0.1:3000 <user>@<EC2> 후 http://localhost:3000
+```
+
 ## 설계 기록
 
 결정은 전부 [`docs/adr/`](./docs/adr)에 있습니다. 왜 그렇게 했는지, 무엇을 포기했는지가

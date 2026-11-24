@@ -1,0 +1,13 @@
+# grafana/dashboards/의 JSON을 읽어 "Nimda CTF" 폴더에 올린다.
+# UI에서 고쳐도 저장되지 않는다(allowUiUpdates: false). 고치려면 JSON을 내보내 레포 파일을 바꾼다.
+apiVersion: 1
+
+providers:
+  - name: nimda-ctf
+    folder: Nimda CTF
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
